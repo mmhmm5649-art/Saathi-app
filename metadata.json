@@ -1,0 +1,6 @@
+{
+  "name": "SAATHI",
+  "description": "Your Friend. Your World. Natural multilingual AI voice companion in Telugu, Hindi, and English. Created by Usman.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

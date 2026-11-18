@@ -1,0 +1,14 @@
+{
+  "name": "saathi-voice-backend",
+  "version": "1.0.0",
+  "description": "Secure ElevenLabs TTS & Scribe STT proxy for SAATHI Android app, verified with Firebase Auth ID tokens.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2",
+    "multer": "^1.4.5-lts.1"
+  }
+}

@@ -1,0 +1,166 @@
+name: SAATHI Android Build, Verification & APK Export
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android SDK Licenses & Ensure API 36 Platform
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          sdkmanager "platforms;android-36.1" || true
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Restore Debug Keystore from Base64
+        run: |
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          fi
+          test -s debug.keystore
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Firebase CLI, Rules Test SDK & Backend Dependencies
+        run: |
+          npm install -g firebase-tools
+          npm install --prefix /tmp/rules-test --no-save @firebase/rules-unit-testing
+          npm --prefix backend install
+
+      - name: Run Backend Voice Proxy Tests
+        run: node --test backend/server.test.js
+
+      - name: Start Firebase Auth & Firestore Emulators and Run Full Verification Suite
+        run: |
+          set -euo pipefail
+          firebase emulators:start --only auth,firestore --project gen-lang-client-0541897442 > /tmp/firebase-emulator.log 2>&1 &
+          EMULATOR_PID=$!
+          trap 'kill $EMULATOR_PID 2>/dev/null || true' EXIT
+
+          READY=0
+          for i in $(seq 1 90); do
+            if curl -s http://127.0.0.1:8085 >/dev/null && curl -s http://127.0.0.1:9099 >/dev/null; then
+              echo "Firebase Auth (9099) & Firestore (8085) emulators are ready."
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: Firebase Auth/Firestore emulators failed to become ready within 90s."
+            cat /tmp/firebase-emulator.log || true
+            exit 1
+          fi
+
+          NODE_PATH=/tmp/rules-test/node_modules FIRESTORE_EMULATOR_HOST="127.0.0.1:8085" node --test firestore.test.js
+          gradle :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
+
+          node -e '
+            const fs = require("node:fs");
+            const xmlPath = "app/build/test-results/testDebugUnitTest/TEST-com.example.data.repository.FirestoreRepositoryRuleTest.xml";
+            const xml = fs.readFileSync(xmlPath, "utf8");
+            const tests = Number((xml.match(/tests="(\d+)"/) || [])[1] || 0);
+            const skipped = Number((xml.match(/skipped="(\d+)"/) || [])[1] || 0);
+            const failures = Number((xml.match(/failures="(\d+)"/) || [])[1] || 0);
+            const errors = Number((xml.match(/errors="(\d+)"/) || [])[1] || 0);
+            console.log({ tests, skipped, failures, errors });
+            if (tests < 4 || skipped > 0 || failures > 0 || errors > 0) {
+              throw new Error("FirestoreRepositoryRuleTest must execute all 4 emulator tests with 0 skipped/failures/errors.");
+            }
+          '
+
+      - name: Verify & Stage Generated Debug APK
+        run: |
+          set -euo pipefail
+          APK_SRC="app/build/outputs/apk/debug/app-debug.apk"
+          APK_STAGE="${{ runner.temp }}/artifacts/debug/app-debug.apk"
+          test -s "$APK_SRC"
+          ls -lh "$APK_SRC"
+          APKSIGNER=$(ls -1 "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"*/apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose "$APK_SRC"
+          mkdir -p "$(dirname "$APK_STAGE")"
+          cp "$APK_SRC" "$APK_STAGE"
+          test -s "$APK_STAGE"
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAATHI-Android-debug-APK
+          path: ${{ runner.temp }}/artifacts/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Check Optional Release Signing Secrets
+        id: release_signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "${GITHUB_WORKSPACE}/my-upload-key.jks"
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release signing secrets not configured; skipping signed release APK generation."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build, Verify & Stage Signed Release APK (When Signing Secrets Are Configured)
+        if: steps.release_signing.outputs.configured == 'true'
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/my-upload-key.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          gradle :app:assembleRelease --console=plain
+          APK_SRC="app/build/outputs/apk/release/app-release.apk"
+          APK_STAGE="${{ runner.temp }}/artifacts/release/app-release.apk"
+          test -s "$APK_SRC"
+          ls -lh "$APK_SRC"
+          APKSIGNER=$(ls -1 "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"*/apksigner | sort -V | tail -n 1)
+          "$APKSIGNER" verify --verbose "$APK_SRC"
+          mkdir -p "$(dirname "$APK_STAGE")"
+          cp "$APK_SRC" "$APK_STAGE"
+          test -s "$APK_STAGE"
+
+      - name: Upload Signed Release APK Artifact
+        if: steps.release_signing.outputs.configured == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAATHI-Android-release-APK
+          path: ${{ runner.temp }}/artifacts/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Clean Up Ephemeral Release Keystore
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/my-upload-key.jks"
+
+
