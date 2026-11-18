@@ -21,13 +21,95 @@ jobs:
           java-version: '21'
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '15859902'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+          packages: platform-tools
 
-      - name: Accept Android SDK Licenses & Ensure API 36 Platform
+      - name: Install Required Android SDK Packages
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
-          sdkmanager "platforms;android-36.1" || true
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -z "$SDK_ROOT" ] || [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::Android SDK root directory not found (ANDROID_HOME='${ANDROID_HOME:-}', ANDROID_SDK_ROOT='${ANDROID_SDK_ROOT:-}')."
+            exit 1
+          fi
+          if [ -n "${ANDROID_HOME:-}" ] && [ -n "${ANDROID_SDK_ROOT:-}" ]; then
+            HOME_REAL="$(readlink -f "$ANDROID_HOME")"
+            ROOT_REAL="$(readlink -f "$ANDROID_SDK_ROOT")"
+            if [ "$HOME_REAL" != "$ROOT_REAL" ]; then
+              echo "::error::Conflicting Android SDK roots detected: ANDROID_HOME=$HOME_REAL vs ANDROID_SDK_ROOT=$ROOT_REAL"
+              exit 1
+            fi
+          fi
+
+          # Prefer the cmdline-tools sdkmanager inside SDK_ROOT (never a stale system binary outside SDK_ROOT)
+          if [ -x "$SDK_ROOT/cmdline-tools/22.0/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/22.0/bin/sdkmanager"
+          elif [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Could not locate executable sdkmanager inside $SDK_ROOT/cmdline-tools."
+            exit 1
+          fi
+
+          # Ensure subsequent steps resolve this exact cmdline-tools bin first on PATH
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          echo "Installing required SDK packages for compileSdk=36.1, targetSdk=36, AGP=9.1.1..."
+          if ! "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-36.1" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" < /dev/null; then
+            echo "::error::Failed to install one or more required Android SDK packages (platform-tools, platforms;android-36.1, platforms;android-36, build-tools;36.0.0)."
+            exit 1
+          fi
+
+      - name: Verify Android SDK & Toolchain Before Gradle
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          echo "=== Java Version ==="
+          java -version 2>&1
+          echo "=== Android SDK Environment ==="
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "which sdkmanager=$(command -v sdkmanager || echo '<not on PATH>')"
+          echo "resolved SDKMANAGER=${SDKMANAGER:-<unset>}"
+          echo "=== sdkmanager Version ==="
+          "$SDKMANAGER" --version
+          echo "=== Installed Android Platforms ==="
+          ls -1 "$SDK_ROOT/platforms"
+          echo "=== Installed Build-Tools ==="
+          ls -1 "$SDK_ROOT/build-tools"
+
+          for required_dir in \
+            "$SDK_ROOT/platform-tools" \
+            "$SDK_ROOT/platforms/android-36.1" \
+            "$SDK_ROOT/platforms/android-36" \
+            "$SDK_ROOT/build-tools/36.0.0"; do
+            if [ ! -d "$required_dir" ]; then
+              echo "::error::Required Android SDK directory is missing after setup: $required_dir"
+              exit 1
+            fi
+          done
+
+          RESOLVED_PATH="$(readlink -f "$(command -v sdkmanager)")"
+          EXPECTED_PATH="$(readlink -f "$SDKMANAGER")"
+          if [ "$RESOLVED_PATH" != "$EXPECTED_PATH" ]; then
+            echo "::error::sdkmanager on PATH ($RESOLVED_PATH) does not match configured SDKMANAGER ($EXPECTED_PATH)."
+            exit 1
+          fi
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
