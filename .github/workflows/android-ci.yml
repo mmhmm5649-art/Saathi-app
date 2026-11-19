@@ -159,6 +159,81 @@ jobs:
           test -s debug.keystore
           keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
 
+      - name: Prepare & Validate Firebase google-services.json
+        id: firebase_config
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 -d > app/google-services.json
+            echo "from_secret=true" >> "$GITHUB_OUTPUT"
+            echo "Decoded app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret."
+          elif [ -s app/google-services.json ]; then
+            echo "from_secret=false" >> "$GITHUB_OUTPUT"
+            echo "Using repository app/google-services.json."
+          else
+            echo "::error::Missing app/google-services.json. Add the GitHub Actions secret GOOGLE_SERVICES_JSON_BASE64 (output of: base64 -w 0 app/google-services.json) in Repository Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          test -s app/google-services.json
+
+          python3 - <<'PY'
+          import json, sys
+
+          path = "app/google-services.json"
+          expected_pkg = "com.aistudio.saathi.x7k9qm"
+          try:
+              with open(path, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception as exc:
+              print(f"::error::app/google-services.json is not valid JSON ({type(exc).__name__}).")
+              sys.exit(1)
+
+          project_id = (data.get("project_info") or {}).get("project_id", "").strip()
+          placeholders = {"", "remixed-project-id", "your-project-id", "placeholder", "example-project"}
+          if project_id.lower() in placeholders:
+              print("::error::app/google-services.json has a missing or placeholder project_info.project_id. Provide the real Firebase project config via GOOGLE_SERVICES_JSON_BASE64.")
+              sys.exit(1)
+
+          clients = data.get("client") or []
+          matched = None
+          for c in clients:
+              pkg = ((c.get("client_info") or {}).get("android_client_info") or {}).get("package_name", "").strip()
+              if pkg == expected_pkg:
+                  matched = c
+                  break
+
+          if not matched:
+              print(f"::error::app/google-services.json does not contain an Android client entry for package '{expected_pkg}'.")
+              sys.exit(1)
+
+          app_id = (matched.get("client_info") or {}).get("mobilesdk_app_id", "").strip()
+          if not app_id:
+              print(f"::error::app/google-services.json client entry for '{expected_pkg}' is missing mobilesdk_app_id.")
+              sys.exit(1)
+
+          oauth_clients = matched.get("oauth_client") or []
+          has_web_client = any(
+              oc.get("client_type") == 3
+              and isinstance(oc.get("client_id"), str)
+              and oc["client_id"].strip().endswith(".apps.googleusercontent.com")
+              for oc in oauth_clients
+          )
+          if not has_web_client:
+              print(
+                  "::error::app/google-services.json for '"
+                  + expected_pkg
+                  + "' is missing an OAuth Web client entry (client_type: 3). "
+                  + "Google Services plugin requires client_type 3 to generate R.string.default_web_client_id. "
+                  + "Enable Google Sign-In in Firebase Console -> Authentication -> Sign-in method, re-download google-services.json, and update GOOGLE_SERVICES_JSON_BASE64."
+              )
+              sys.exit(1)
+
+          print(f"Validated app/google-services.json for package {expected_pkg} (project_id present, mobilesdk_app_id present, OAuth client_type=3 Web Client present).")
+          PY
+
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
@@ -197,7 +272,11 @@ jobs:
           fi
 
           NODE_PATH=/tmp/rules-test/node_modules FIRESTORE_EMULATOR_HOST="127.0.0.1:8085" node --test firestore.test.js
-          gradle :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
+          gradle :app:processDebugGoogleServices :app:processReleaseGoogleServices :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
+
+          grep -q 'name="default_web_client_id"' app/build/generated/res/processDebugGoogleServices/values/values.xml
+          grep -q 'name="default_web_client_id"' app/build/generated/res/processReleaseGoogleServices/values/values.xml
+          echo "Verified default_web_client_id resource generated for both debug and release builds."
 
           node -e '
             const fs = require("node:fs");
@@ -277,8 +356,12 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Clean Up Ephemeral Release Keystore
+      - name: Clean Up Ephemeral Keystore & Firebase Config
         if: always()
-        run: rm -f "${GITHUB_WORKSPACE}/my-upload-key.jks"
+        run: |
+          rm -f "${GITHUB_WORKSPACE}/my-upload-key.jks"
+          if [ "${{ steps.firebase_config.outputs.from_secret }}" = "true" ]; then
+            rm -f app/google-services.json
+          fi
 
 
