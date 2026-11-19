@@ -116,12 +116,48 @@ jobs:
         with:
           gradle-version: '9.3.1'
 
-      - name: Restore Debug Keystore from Base64
+      - name: Prepare Debug Signing Keystore
         run: |
-          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
+          set -euo pipefail
+          if [ -s debug.keystore ]; then
+            if keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+              echo "Using existing valid debug.keystore."
+            else
+              echo "::warning::Existing debug.keystore is invalid; removing and regenerating."
+              rm -f debug.keystore
+            fi
           fi
+
+          if [ ! -s debug.keystore ] && [ -s debug.keystore.base64 ]; then
+            echo "Found optional debug.keystore.base64; decoding..."
+            if base64 -d debug.keystore.base64 > debug.keystore 2>/dev/null \
+              && [ -s debug.keystore ] \
+              && keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+              echo "Restored valid debug.keystore from debug.keystore.base64."
+            else
+              echo "::warning::debug.keystore.base64 failed to decode or validate; generating standard debug.keystore instead."
+              rm -f debug.keystore
+            fi
+          fi
+
+          if [ ! -s debug.keystore ]; then
+            echo "No valid debug.keystore or debug.keystore.base64 present; generating standard Android debug.keystore for CI debug signing."
+            keytool -genkeypair \
+              -keystore debug.keystore \
+              -storetype PKCS12 \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -sigalg SHA256withRSA \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -noprompt
+          fi
+
           test -s debug.keystore
+          keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
