@@ -8,7 +8,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -16,7 +15,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
-import androidx.credentials.CredentialManager
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
@@ -34,12 +32,7 @@ import com.example.data.local.UserPreferencesState
 import com.example.data.remote.FirestoreRepository
 import com.example.data.remote.SaathiAiRepository
 import com.example.data.remote.VoiceBackendClient
-import com.example.security.DebugGuestPolicy
-import com.example.security.attemptAutoSignIn
-import com.example.security.authStateFlow
 import com.example.security.configureAppCheck
-import com.example.security.signOutUser
-import com.example.ui.screens.AuthScreen
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.LanguageSelectionScreen
 import com.example.ui.screens.MemoryScreen
@@ -70,6 +63,10 @@ object SaathiRoutes {
     const val PROFILE = "profile"
 }
 
+private const val LOCAL_USER_ID = "local_saathi_user"
+private const val LOCAL_DISPLAY_NAME = "SAATHI Friend"
+private const val LOCAL_PROFILE_SUBTITLE = "Private on-device profile"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -99,30 +96,9 @@ private fun SaathiRootApp() {
     val scope = rememberCoroutineScope()
     val prefsRepo = remember { UserPreferencesRepository(context.applicationContext) }
     val preferences by prefsRepo.preferencesFlow.collectAsStateWithLifecycle(initialValue = UserPreferencesState())
-    val credentialManager = remember { CredentialManager.create(context) }
 
     var showSplash by remember { mutableStateOf(true) }
-    var debugGuestRequested by remember { mutableStateOf(false) }
-    val currentUser by Firebase.auth.authStateFlow()
-        .collectAsStateWithLifecycle(initialValue = Firebase.auth.currentUser)
-
-    // Attempt silent Google Auto-Sign-In on startup when no user is cached yet
-    LaunchedEffect(Unit) {
-        if (Firebase.auth.currentUser == null) {
-            attemptAutoSignIn(
-                context = context,
-                credentialManager = credentialManager,
-                onAuthSuccess = {},
-                onUnauthenticated = {},
-                scope = scope
-            )
-        }
-    }
-
-    val isGuestAllowed = DebugGuestPolicy.isGuestSessionAllowed(
-        isDebugBuild = BuildConfig.DEBUG,
-        guestRequested = debugGuestRequested
-    )
+    val currentUser = remember { runCatching { Firebase.auth.currentUser }.getOrNull() }
 
     when {
         showSplash -> {
@@ -141,38 +117,20 @@ private fun SaathiRootApp() {
             )
         }
 
-        currentUser == null && !isGuestAllowed -> {
-            // Strict Auth Gate in release builds; debug builds optionally allow temporary local guest testing
-            AuthScreen(
-                onAuthSuccess = { debugGuestRequested = false },
-                isDebugBuild = BuildConfig.DEBUG,
-                onSkipForNow = if (BuildConfig.DEBUG) {
-                    { debugGuestRequested = true }
-                } else null
-            )
-        }
-
         else -> {
-            val user = currentUser
-            val activeUserId = user?.uid ?: DebugGuestPolicy.DEBUG_GUEST_USER_ID
-            val activeDisplayName = user?.displayName ?: DebugGuestPolicy.DEBUG_GUEST_DISPLAY_NAME
-            val activeEmail = user?.email ?: DebugGuestPolicy.DEBUG_GUEST_EMAIL
-            val activePhotoUrl = user?.photoUrl?.toString()
-            val activeIsGuest = user == null && isGuestAllowed
+            val activeUserId = currentUser?.uid ?: LOCAL_USER_ID
+            val activeDisplayName = currentUser?.displayName?.takeIf { it.isNotBlank() } ?: LOCAL_DISPLAY_NAME
+            val activeEmail = currentUser?.email?.takeIf { it.isNotBlank() } ?: LOCAL_PROFILE_SUBTITLE
+            val activePhotoUrl = currentUser?.photoUrl?.toString()
+            val isLocalSession = currentUser == null
 
             key(activeUserId) {
-                AuthenticatedSaathiApp(
+                SaathiAppContent(
                     currentUserId = activeUserId,
                     displayName = activeDisplayName,
                     email = activeEmail,
                     photoUrl = activePhotoUrl,
-                    isGuestSession = activeIsGuest,
-                    onSignOut = {
-                        debugGuestRequested = false
-                        if (!activeIsGuest) {
-                            signOutUser(credentialManager = credentialManager, scope = scope)
-                        }
-                    }
+                    isLocalSession = isLocalSession
                 )
             }
         }
@@ -180,13 +138,12 @@ private fun SaathiRootApp() {
 }
 
 @Composable
-private fun AuthenticatedSaathiApp(
+private fun SaathiAppContent(
     currentUserId: String,
     displayName: String,
     email: String,
     photoUrl: String?,
-    isGuestSession: Boolean,
-    onSignOut: () -> Unit
+    isLocalSession: Boolean
 ) {
     val context = LocalContext.current
     val navController = rememberNavController()
@@ -202,7 +159,7 @@ private fun AuthenticatedSaathiApp(
                     userDisplayName = displayName,
                     userEmail = email,
                     userPhotoUrl = photoUrl,
-                    isGuestSession = isGuestSession,
+                    isGuestSession = isLocalSession,
                     dao = db.saathiDao(),
                     prefsRepo = UserPreferencesRepository(app),
                     firestoreRepo = FirestoreRepository(app),
@@ -277,7 +234,7 @@ private fun AuthenticatedSaathiApp(
                 onDismissError = viewModel::clearError,
                 onVoiceScreenReady = viewModel::onVoiceScreenReady,
                 onMicPermissionResult = viewModel::onMicPermissionResult,
-                onExitGuest = if (isGuestSession) onSignOut else null
+                onVoiceScreenDisposed = viewModel::stopVoiceOnlyForModeSwitch
             )
         }
 
@@ -330,7 +287,7 @@ private fun AuthenticatedSaathiApp(
                 conversations = conversations,
                 searchQuery = uiState.historySearchQuery,
                 cloudSyncEnabled = preferences.cloudSyncEnabled,
-                isGuestSession = isGuestSession,
+                isGuestSession = isLocalSession,
                 onSearchChange = viewModel::updateSearchQuery,
                 onOpenConversation = { convId ->
                     viewModel.selectConversation(convId)
@@ -349,7 +306,7 @@ private fun AuthenticatedSaathiApp(
             MemoryScreen(
                 memories = memories,
                 memoryEnabled = preferences.memoryEnabled,
-                isGuestSession = isGuestSession,
+                isGuestSession = isLocalSession,
                 onToggleMemoryEnabled = viewModel::setMemoryEnabled,
                 onSaveMemory = viewModel::saveMemory,
                 onDeleteMemory = viewModel::deleteMemory,
@@ -378,7 +335,7 @@ private fun AuthenticatedSaathiApp(
                 photoUrl = photoUrl,
                 preferences = preferences,
                 isDeleting = uiState.isDeletingAccount,
-                isGuestSession = isGuestSession,
+                isGuestSession = isLocalSession,
                 onUpdatePreferredName = { name ->
                     viewModel.updatePreferredName(name)
                     Toast.makeText(context, "Preferred name saved", Toast.LENGTH_SHORT).show()
@@ -387,16 +344,14 @@ private fun AuthenticatedSaathiApp(
                 onToggleCloudSync = viewModel::setCloudSyncEnabled,
                 onOpenLanguageSelect = { navController.navigate(SaathiRoutes.LANGUAGE_SELECT) },
                 onOpenVoiceSelect = { navController.navigate(SaathiRoutes.VOICE_SELECT) },
-                onSignOut = onSignOut,
                 onDeleteAccount = {
                     viewModel.deleteAccountAndData(
                         onComplete = {
                             Toast.makeText(
                                 context,
-                                if (isGuestSession) "Local guest data cleared" else "Account and data deleted",
+                                if (isLocalSession) "Local data cleared" else "Account and data deleted",
                                 Toast.LENGTH_SHORT
                             ).show()
-                            if (isGuestSession) onSignOut()
                         },
                         onError = { msg ->
                             Toast.makeText(context, msg, Toast.LENGTH_LONG).show()

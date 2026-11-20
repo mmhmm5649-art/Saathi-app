@@ -455,4 +455,115 @@ class AndroidSpeechRecognizerManagerTest {
         assertEquals(1, textChatClicks)
         assertEquals(1, dismissClicks)
     }
+
+    @Test
+    fun `silence timeout, no match, and network errors emit friendly messages and release recognizer`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val cases = listOf(
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT to "hear anything",
+            SpeechRecognizer.ERROR_NO_MATCH to "catch that",
+            SpeechRecognizer.ERROR_NETWORK to "internet connection"
+        )
+        for ((errorCode, expectedPhrase) in cases) {
+            val created = mutableListOf<FakeSpeechRecognizerClient>()
+            val errors = mutableListOf<String>()
+            val manager = AndroidSpeechRecognizerManager(
+                context = context,
+                recognizerFactory = { _, d -> FakeSpeechRecognizerClient(d).also { created.add(it) } },
+                envChecker = FakeEnvironmentChecker()
+            )
+            assertTrue(manager.startListening(SaathiLanguage.TELUGU, {}, {}, {}, {}, { errors.add(it) }))
+            created.single().listener?.onError(errorCode)
+
+            assertFalse(manager.isSessionActive())
+            assertEquals(1, created.single().destroyCount)
+            assertEquals(1, errors.size)
+            assertTrue(
+                "Expected error message to mention '$expectedPhrase', got '${errors.single()}'",
+                errors.single().contains(expectedPhrase, ignoreCase = true)
+            )
+        }
+    }
+
+    @Test
+    fun `switching language cancels previous session and restarts with exact new locale tag`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val created = mutableListOf<FakeSpeechRecognizerClient>()
+        val manager = AndroidSpeechRecognizerManager(
+            context = context,
+            recognizerFactory = { _, d -> FakeSpeechRecognizerClient(d).also { created.add(it) } },
+            envChecker = FakeEnvironmentChecker()
+        )
+
+        val teluguPartials = mutableListOf<String>()
+        val hindiFinals = mutableListOf<String>()
+        val englishFinals = mutableListOf<String>()
+
+        assertTrue(manager.startListening(SaathiLanguage.TELUGU, {}, {}, { teluguPartials.add(it) }, {}, {}))
+        assertEquals("te-IN", created[0].startedIntent?.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+
+        // Switch Telugu -> Hindi
+        manager.cancel()
+        assertEquals(1, created[0].cancelCount)
+        assertEquals(1, created[0].destroyCount)
+
+        assertTrue(manager.startListening(SaathiLanguage.HINDI, {}, {}, {}, { hindiFinals.add(it) }, {}))
+        assertEquals("hi-IN", created[1].startedIntent?.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+
+        // Late partial from old Telugu recognizer must be ignored
+        created[0].listener?.onPartialResults(resultsBundle("ఎలా ఉన్నావ్"))
+        assertTrue(teluguPartials.isEmpty())
+
+        created[1].listener?.onResults(resultsBundle("कैसे हो दोस्त"))
+        assertEquals(listOf("कैसे हो दोस्त"), hindiFinals)
+
+        // Switch Hindi -> English
+        assertTrue(manager.startListening(SaathiLanguage.ENGLISH, {}, {}, {}, { englishFinals.add(it) }, {}))
+        assertEquals("en-IN", created[2].startedIntent?.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE))
+        created[2].listener?.onResults(resultsBundle("Hey Saathi"))
+        assertEquals(listOf("Hey Saathi"), englishFinals)
+    }
+
+    @Test
+    fun `VoiceCompanionScreen displays live Roman Telugu transcript and triggers disposal cleanup`() {
+        var disposedCount = 0
+        val showScreen = androidx.compose.runtime.mutableStateOf(true)
+        composeRule.mainClock.autoAdvance = false
+
+        composeRule.setContent {
+            SaathiTheme {
+                if (showScreen.value) {
+                    VoiceCompanionScreen(
+                        uiState = CompanionUiState(
+                            voiceSessionState = VoiceSessionState.LISTENING,
+                            liveTranscript = "Ela unnav ra? Baagunnava?"
+                        ),
+                        preferences = UserPreferencesState(preferredLanguage = SaathiLanguage.TELUGU),
+                        onMicClick = {},
+                        onLanguageSelected = {},
+                        onEndConversation = {},
+                        onToggleMute = {},
+                        onOpenTextChat = {},
+                        onOpenVoiceSelect = {},
+                        onOpenSettings = {},
+                        onOpenMemories = {},
+                        onOpenHistory = {},
+                        onAcceptMemory = {},
+                        onDismissMemory = {},
+                        onRetryError = {},
+                        onDismissError = {},
+                        onVoiceScreenDisposed = { disposedCount++ }
+                    )
+                }
+            }
+        }
+        composeRule.mainClock.advanceTimeBy(120L)
+
+        composeRule.onNodeWithText("I'm listening...").assertIsDisplayed()
+        composeRule.onNodeWithText("Ela unnav ra? Baagunnava?").assertIsDisplayed()
+
+        composeRule.runOnUiThread { showScreen.value = false }
+        composeRule.mainClock.advanceTimeBy(120L)
+        assertEquals(1, disposedCount)
+    }
 }

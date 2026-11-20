@@ -345,6 +345,63 @@ test("extracts ElevenLabs Voice IDs cleanly whether provided as raw IDs or URLs"
   if (fs.existsSync(cfgPath)) fs.unlinkSync(cfgPath);
 });
 
+test("backend auth middleware accepts valid Firebase App Check or Bearer tokens and rejects unauthorized requests", async () => {
+  const { createFirebaseAuthMiddleware } = require("./authMiddleware");
+  const middleware = createFirebaseAuthMiddleware({
+    verifyIdToken: async (token) => {
+      if (token === "valid_id_token") return { uid: "user_123" };
+      throw new Error("bad id token");
+    },
+    verifyAppCheckToken: async (token) => {
+      if (token === "valid_app_check_token") return { appId: "1:123:android:abc" };
+      throw new Error("bad app check token");
+    },
+  });
+
+  const invoke = async (headers) => {
+    const req = { headers };
+    let statusCode = 200;
+    let jsonBody = null;
+    let nextCalled = false;
+    const res = {
+      status(code) {
+        statusCode = code;
+        return this;
+      },
+      json(body) {
+        jsonBody = body;
+        return this;
+      },
+    };
+    await middleware(req, res, () => {
+      nextCalled = true;
+    });
+    return { statusCode, jsonBody, nextCalled, req };
+  };
+
+  // 1. Valid App Check token works without Google Sign-In / Bearer ID token
+  const appCheckOk = await invoke({ "x-firebase-appcheck": "valid_app_check_token" });
+  assert.equal(appCheckOk.nextCalled, true);
+  assert.equal(appCheckOk.req.authMethod, "firebase_app_check");
+  assert.equal(appCheckOk.req.appCheck.appId, "1:123:android:abc");
+
+  // 2. Valid Firebase ID token still works
+  const bearerOk = await invoke({ authorization: "Bearer valid_id_token" });
+  assert.equal(bearerOk.nextCalled, true);
+  assert.equal(bearerOk.req.authMethod, "firebase_id_token");
+  assert.equal(bearerOk.req.user.uid, "user_123");
+
+  // 3. Missing credentials rejected with 401
+  const missing = await invoke({});
+  assert.equal(missing.nextCalled, false);
+  assert.equal(missing.statusCode, 401);
+
+  // 4. Invalid App Check token rejected with 401
+  const invalidAppCheck = await invoke({ "x-firebase-appcheck": "tampered" });
+  assert.equal(invalidAppCheck.nextCalled, false);
+  assert.equal(invalidAppCheck.statusCode, 401);
+});
+
 if (process.env.ELEVENLABS_API_KEY) {
   test("LIVE ELEVENLABS INTEGRATION: tests BOTH configured Male and Female Voice IDs across Telugu, Hindi, and English", async () => {
     const cfgPath = makeTempConfigPath();

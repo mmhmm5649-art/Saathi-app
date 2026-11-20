@@ -35,6 +35,8 @@ class VoiceBackendClientTest {
     private lateinit var baseUrl: String
     private val capturedTtsRequests = CopyOnWriteArrayList<JSONObject>()
     private val capturedTtsPaths = CopyOnWriteArrayList<String>()
+    private val capturedAppCheckHeaders = CopyOnWriteArrayList<String>()
+    private val capturedAuthHeaders = CopyOnWriteArrayList<String>()
     private val scriptedTtsStatuses = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, String?>>()
     private val scriptedSttStatuses = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, String?>>()
     private val ttsRequestCounter = AtomicInteger(0)
@@ -63,6 +65,8 @@ class VoiceBackendClientTest {
         }
 
         server.createContext("/v1/voices") { exchange ->
+            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
+            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
             val path = exchange.requestURI.path
             if (path.endsWith("/config") && exchange.requestMethod == "POST") {
                 val reqBody = JSONObject(exchange.requestBody.bufferedReader().readText())
@@ -106,6 +110,8 @@ class VoiceBackendClientTest {
         }
 
         val ttsHandler: (com.sun.net.httpserver.HttpExchange) -> Unit = { exchange ->
+            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
+            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
             ttsRequestCounter.incrementAndGet()
             capturedTtsPaths.add(exchange.requestURI.path)
             val body = JSONObject(exchange.requestBody.bufferedReader().readText())
@@ -132,6 +138,8 @@ class VoiceBackendClientTest {
         server.createContext("/v1/tts/preview", ttsHandler)
 
         server.createContext("/v1/stt") { exchange ->
+            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
+            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
             sttRequestCounter.incrementAndGet()
             sttStartedLatch?.countDown()
             val delayMs = sttArtificialDelayMs.get()
@@ -422,5 +430,38 @@ class VoiceBackendClientTest {
             "Expected CancellationException when cancelActiveSttRequest() aborts in-flight Scribe upload, got $thrown",
             thrown is kotlinx.coroutines.CancellationException
         )
+    }
+
+    @Test
+    fun `voice backend works without Google Sign-In using Firebase App Check header`() = runTest {
+        val context = ApplicationProvider.getApplicationContext<android.content.Context>()
+        val client = VoiceBackendClient(
+            context = context,
+            tokenProvider = { null },
+            appCheckTokenProvider = { "valid_app_check_token_xyz" }
+        )
+
+        val voicesRes = client.fetchConfiguredVoices(baseUrl)
+        assertTrue(voicesRes is VoiceBackendResult.Success)
+
+        val ttsRes = client.synthesizeSpeechToCacheFile(
+            baseUrl = baseUrl,
+            text = "Hello from local SAATHI companion",
+            voiceSlot = SaathiVoiceCatalog.SLOT_FEMALE,
+            voiceId = configuredFemaleId,
+            modelId = SaathiVoiceCatalog.DEFAULT_TTS_MODEL,
+            language = SaathiLanguage.ENGLISH,
+            speed = 1.0f,
+            isPreview = false
+        )
+        assertTrue(ttsRes is VoiceBackendResult.Success)
+        (ttsRes as VoiceBackendResult.Success).data.delete()
+
+        val sttRes = client.transcribeWithScribe(baseUrl, "RIFFWAVE".toByteArray(), SaathiLanguage.ENGLISH)
+        assertTrue(sttRes is VoiceBackendResult.Success)
+
+        assertTrue("Authorization header must not be sent when no Firebase Auth user exists", capturedAuthHeaders.isEmpty())
+        assertEquals(3, capturedAppCheckHeaders.size)
+        assertTrue(capturedAppCheckHeaders.all { it == "valid_app_check_token_xyz" })
     }
 }

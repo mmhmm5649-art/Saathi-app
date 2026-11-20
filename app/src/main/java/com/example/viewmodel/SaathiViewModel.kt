@@ -182,6 +182,9 @@ class SaathiViewModel(
     private var isSessionEndedByUser: Boolean = false
 
     @Volatile
+    private var pendingLanguageOverride: SaathiLanguage? = null
+
+    @Volatile
     private var isAppInForeground: Boolean = true
     private var voiceTurnSequence: Long = 0L
     private var ttsTurnToken: Long = 0L
@@ -648,7 +651,7 @@ class SaathiViewModel(
         autoTurnJob?.cancel()
         autoTurnJob = null
         val prefs = preferences.value
-        val activeLanguage = languageOverride ?: prefs.preferredLanguage
+        val activeLanguage = languageOverride ?: pendingLanguageOverride ?: prefs.preferredLanguage
         val turnToken = ++voiceTurnSequence
         sttListeningStartAtNs = latencyRecorder.nowNs()
 
@@ -1982,18 +1985,39 @@ class SaathiViewModel(
     }
 
     fun setLanguage(language: SaathiLanguage) {
+        pendingLanguageOverride = language
         val wasListeningAndroidSpeech = _uiState.value.voiceSessionState == VoiceSessionState.LISTENING &&
             !_uiState.value.isRecordingScribe
-        if (wasListeningAndroidSpeech) {
+        val switchToken = if (wasListeningAndroidSpeech) {
+            val nextToken = ++voiceTurnSequence
             speechRecognizer.cancel()
-            _uiState.update { it.copy(voiceSessionState = VoiceSessionState.IDLE, audioAmplitude = 0.08f) }
+            _uiState.update {
+                it.copy(
+                    voiceSessionState = VoiceSessionState.IDLE,
+                    liveTranscript = "",
+                    audioAmplitude = 0.08f
+                )
+            }
+            nextToken
+        } else {
+            voiceTurnSequence
         }
         viewModelScope.launch {
-            prefsRepo.setLanguage(language)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("preferredLanguage" to language.name))
+            try {
+                prefsRepo.setLanguage(language)
+                if (canUseCloudSync) {
+                    firestoreRepo.updateProfileFields(mapOf("preferredLanguage" to language.name))
+                }
+            } finally {
+                if (pendingLanguageOverride == language) {
+                    pendingLanguageOverride = null
+                }
             }
-            if (wasListeningAndroidSpeech && isAppInForeground && !isSessionEndedByUser) {
+            if (wasListeningAndroidSpeech &&
+                switchToken == voiceTurnSequence &&
+                isAppInForeground &&
+                !isSessionEndedByUser
+            ) {
                 startVoiceListening(languageOverride = language)
             }
         }
@@ -2223,13 +2247,15 @@ class SaathiViewModel(
                     prefsRepo.clearAll()
                     runCatching { Firebase.auth.currentUser?.delete()?.await() }
                     Firebase.auth.signOut()
+                } else {
+                    startNewConversation()
                 }
                 _uiState.update { it.copy(isDeletingAccount = false) }
                 onComplete()
             } catch (e: Exception) {
-                Log.e(TAG, "Account deletion failed", e)
+                Log.e(TAG, "Data deletion failed", e)
                 _uiState.update { it.copy(isDeletingAccount = false) }
-                onError(e.localizedMessage ?: "Please sign in again before deleting your account.")
+                onError(e.localizedMessage ?: "Unable to clear saved data right now. Please try again.")
             }
         }
     }

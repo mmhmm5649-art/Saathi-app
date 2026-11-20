@@ -36,7 +36,7 @@ class FirestoreRepository(private val db: FirebaseFirestore) {
 
     private fun requireUserId(): String =
         auth.currentUser?.uid
-            ?: throw IllegalStateException("User must be signed in with Google before accessing Firestore.")
+            ?: throw IllegalStateException("Authenticated Firebase user required before accessing Firestore.")
 
     fun observeProfile(userId: String): Flow<UserProfileDoc?> = flow {
         val docRef = db.collection("users").document(userId)

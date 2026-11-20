@@ -166,41 +166,65 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
-            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 -d > app/google-services.json
+            if ! printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 -d > app/google-services.json 2>/dev/null; then
+              rm -f app/google-services.json
+              echo "::error::GitHub Actions secret GOOGLE_SERVICES_JSON_BASE64 is not valid Base64. Encode the Firebase google-services.json file with: base64 -w 0 app/google-services.json"
+              exit 1
+            fi
             echo "from_secret=true" >> "$GITHUB_OUTPUT"
             echo "Decoded app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret."
           elif [ -s app/google-services.json ]; then
             echo "from_secret=false" >> "$GITHUB_OUTPUT"
-            echo "Using repository app/google-services.json."
+            echo "Using existing app/google-services.json."
           else
-            echo "::error::Missing app/google-services.json. Add the GitHub Actions secret GOOGLE_SERVICES_JSON_BASE64 (output of: base64 -w 0 app/google-services.json) in Repository Settings -> Secrets and variables -> Actions."
+            echo "::error::Missing app/google-services.json. Add the GitHub Actions repository secret GOOGLE_SERVICES_JSON_BASE64 (base64-encoded contents of google-services.json for Firebase project gen-lang-client-0541897442) in Settings -> Secrets and variables -> Actions."
             exit 1
           fi
 
-          test -s app/google-services.json
+          if [ ! -s app/google-services.json ]; then
+            echo "::error::Decoded app/google-services.json is empty."
+            exit 1
+          fi
 
           python3 - <<'PY'
           import json, sys
 
           path = "app/google-services.json"
+          expected_project_id = "gen-lang-client-0541897442"
           expected_pkg = "com.aistudio.saathi.x7k9qm"
+
           try:
               with open(path, "r", encoding="utf-8") as f:
                   data = json.load(f)
           except Exception as exc:
-              print(f"::error::app/google-services.json is not valid JSON ({type(exc).__name__}).")
+              print(f"::error::app/google-services.json is not valid JSON ({type(exc).__name__}). Verify GOOGLE_SERVICES_JSON_BASE64 encodes the raw JSON file.")
               sys.exit(1)
 
-          project_id = (data.get("project_info") or {}).get("project_id", "").strip()
-          placeholders = {"", "remixed-project-id", "your-project-id", "placeholder", "example-project"}
-          if project_id.lower() in placeholders:
-              print("::error::app/google-services.json has a missing or placeholder project_info.project_id. Provide the real Firebase project config via GOOGLE_SERVICES_JSON_BASE64.")
+          if not isinstance(data, dict):
+              print("::error::app/google-services.json root must be a JSON object.")
               sys.exit(1)
 
-          clients = data.get("client") or []
+          project_id = str((data.get("project_info") or {}).get("project_id") or "").strip()
+          if not project_id:
+              print("::error::app/google-services.json is missing project_info.project_id.")
+              sys.exit(1)
+          if project_id != expected_project_id:
+              print(
+                  f"::error::app/google-services.json belongs to a different Firebase project (expected '{expected_project_id}'). "
+                  "Download google-services.json from the SAATHI Firebase project and update GOOGLE_SERVICES_JSON_BASE64."
+              )
+              sys.exit(1)
+
+          clients = data.get("client")
+          if not isinstance(clients, list) or len(clients) == 0:
+              print("::error::app/google-services.json has no 'client' entries.")
+              sys.exit(1)
+
           matched = None
           for c in clients:
-              pkg = ((c.get("client_info") or {}).get("android_client_info") or {}).get("package_name", "").strip()
+              if not isinstance(c, dict):
+                  continue
+              pkg = str(((c.get("client_info") or {}).get("android_client_info") or {}).get("package_name") or "").strip()
               if pkg == expected_pkg:
                   matched = c
                   break
@@ -209,29 +233,21 @@ jobs:
               print(f"::error::app/google-services.json does not contain an Android client entry for package '{expected_pkg}'.")
               sys.exit(1)
 
-          app_id = (matched.get("client_info") or {}).get("mobilesdk_app_id", "").strip()
+          app_id = str((matched.get("client_info") or {}).get("mobilesdk_app_id") or "").strip()
           if not app_id:
               print(f"::error::app/google-services.json client entry for '{expected_pkg}' is missing mobilesdk_app_id.")
               sys.exit(1)
 
-          oauth_clients = matched.get("oauth_client") or []
-          has_web_client = any(
-              oc.get("client_type") == 3
-              and isinstance(oc.get("client_id"), str)
-              and oc["client_id"].strip().endswith(".apps.googleusercontent.com")
-              for oc in oauth_clients
+          api_keys = matched.get("api_key") or []
+          has_api_key = any(
+              isinstance(k, dict) and isinstance(k.get("current_key"), str) and k["current_key"].strip()
+              for k in api_keys
           )
-          if not has_web_client:
-              print(
-                  "::error::app/google-services.json for '"
-                  + expected_pkg
-                  + "' is missing an OAuth Web client entry (client_type: 3). "
-                  + "Google Services plugin requires client_type 3 to generate R.string.default_web_client_id. "
-                  + "Enable Google Sign-In in Firebase Console -> Authentication -> Sign-in method, re-download google-services.json, and update GOOGLE_SERVICES_JSON_BASE64."
-              )
+          if not has_api_key:
+              print(f"::error::app/google-services.json client entry for '{expected_pkg}' is missing api_key.current_key.")
               sys.exit(1)
 
-          print(f"Validated app/google-services.json for package {expected_pkg} (project_id present, mobilesdk_app_id present, OAuth client_type=3 Web Client present).")
+          print(f"Validated app/google-services.json for project '{expected_project_id}' and package '{expected_pkg}' (mobilesdk_app_id and api_key verified for Firebase Core, AI Logic, Firestore & App Check).")
           PY
 
       - name: Set up Node.js 20
@@ -274,9 +290,18 @@ jobs:
           NODE_PATH=/tmp/rules-test/node_modules FIRESTORE_EMULATOR_HOST="127.0.0.1:8085" node --test firestore.test.js
           gradle :app:processDebugGoogleServices :app:processReleaseGoogleServices :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
 
-          grep -q 'name="default_web_client_id"' app/build/generated/res/processDebugGoogleServices/values/values.xml
-          grep -q 'name="default_web_client_id"' app/build/generated/res/processReleaseGoogleServices/values/values.xml
-          echo "Verified default_web_client_id resource generated for both debug and release builds."
+          for res_file in \
+            app/build/generated/res/processDebugGoogleServices/values/values.xml \
+            app/build/generated/res/processReleaseGoogleServices/values/values.xml; do
+            test -s "$res_file"
+            for res_name in google_app_id google_api_key project_id; do
+              if ! grep -q "name=\"${res_name}\"" "$res_file"; then
+                echo "::error::Expected generated Firebase resource '${res_name}' missing from ${res_file}"
+                exit 1
+              fi
+            done
+          done
+          echo "Verified Firebase resources (google_app_id, google_api_key, project_id) generated for both debug and release builds."
 
           node -e '
             const fs = require("node:fs");
@@ -299,7 +324,15 @@ jobs:
           APK_STAGE="${{ runner.temp }}/artifacts/debug/app-debug.apk"
           test -s "$APK_SRC"
           ls -lh "$APK_SRC"
-          APKSIGNER=$(ls -1 "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"*/apksigner | sort -V | tail -n 1)
+          BUILD_TOOLS_DIR=$(ls -1d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"* | sort -V | tail -n 1)
+          AAPT2="${BUILD_TOOLS_DIR}/aapt2"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          BADGING=$("$AAPT2" dump badging "$APK_SRC")
+          echo "$BADGING" | grep -E "^(package:|application-label:|sdkVersion:|targetSdkVersion:)"
+          if ! echo "$BADGING" | grep -q "package: name='com.aistudio.saathi.x7k9qm'"; then
+            echo "::error::Debug APK package name mismatch. Expected 'com.aistudio.saathi.x7k9qm'."
+            exit 1
+          fi
           "$APKSIGNER" verify --verbose "$APK_SRC"
           mkdir -p "$(dirname "$APK_STAGE")"
           cp "$APK_SRC" "$APK_STAGE"
@@ -341,7 +374,15 @@ jobs:
           APK_STAGE="${{ runner.temp }}/artifacts/release/app-release.apk"
           test -s "$APK_SRC"
           ls -lh "$APK_SRC"
-          APKSIGNER=$(ls -1 "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"*/apksigner | sort -V | tail -n 1)
+          BUILD_TOOLS_DIR=$(ls -1d "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools/"* | sort -V | tail -n 1)
+          AAPT2="${BUILD_TOOLS_DIR}/aapt2"
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          BADGING=$("$AAPT2" dump badging "$APK_SRC")
+          echo "$BADGING" | grep -E "^(package:|application-label:|sdkVersion:|targetSdkVersion:)"
+          if ! echo "$BADGING" | grep -q "package: name='com.aistudio.saathi.x7k9qm'"; then
+            echo "::error::Release APK package name mismatch. Expected 'com.aistudio.saathi.x7k9qm'."
+            exit 1
+          fi
           "$APKSIGNER" verify --verbose "$APK_SRC"
           mkdir -p "$(dirname "$APK_STAGE")"
           cp "$APK_SRC" "$APK_STAGE"
@@ -355,6 +396,18 @@ jobs:
           path: ${{ runner.temp }}/artifacts/release/app-release.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload Failure Diagnostic Logs & Test Reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SAATHI-CI-failure-logs
+          path: |
+            app/build/reports/tests/
+            app/build/test-results/
+            /tmp/firebase-emulator.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Clean Up Ephemeral Keystore & Firebase Config
         if: always()

@@ -20,9 +20,14 @@ backend/voice-config.json
 backend/node_modules/
 node_modules/
 debug.keystore
+debug.keystore.base64
 *.jks
+*.jks.base64
 *.keystore
+*.keystore.base64
 *service-account*.json
 *firebase-adminsdk*.json
+app/google-services.json
+.build-outputs/
 *-debug.log
 

@@ -2,17 +2,17 @@
 
 **Created by Usman**
 
-SAATHI is a native Android AI Voice Companion built with Kotlin, Jetpack Compose, Material 3, Firebase (Auth, Cloud Firestore, App Check, Firebase AI Logic with Gemini), Room, DataStore, and a secure ElevenLabs Voice Backend proxy.
+SAATHI is a native Android AI Voice Companion built with Kotlin, Jetpack Compose, Material 3, Firebase (Core, Cloud Firestore, App Check, Firebase AI Logic with Gemini), Room, DataStore, and a secure ElevenLabs Voice Backend proxy.
 
 ---
 
 ## 1. Firebase Setup
-- **Firebase AI Logic (Gemini 3.8 Flash & Gemini 3.5 Flash-Lite)**: Configured via `google-services.json`, App Check (`configureAppCheck(this, intent)` in `MainActivity.onCreate`), and `Firebase.ai` — no client-side `GEMINI_API_KEY` is embedded in the APK.
-- **Firebase Authentication**: Configured with Google Sign-In via Jetpack `CredentialManager` (`GetSignInWithGoogleOption`). If you also wish to enable Email/Password or Anonymous guest sign-in, enable those providers in the Firebase Console (`gen-lang-client-0541897442`).
+- **No Google Login Required**: SAATHI opens directly into the companion experience (Splash -> First-Launch Onboarding -> Voice Companion) using private on-device Room & DataStore storage without requiring Google Sign-In or OAuth web client IDs.
+- **Firebase AI Logic (Gemini 2.5 Flash & Gemini 2.5 Flash-Lite)**: Configured via `app/google-services.json`, App Check (`configureAppCheck(this, intent)` in `MainActivity.onCreate`), and `Firebase.ai` — no client-side `GEMINI_API_KEY` is embedded in the APK.
 - **Cloud Firestore**: Uses the provisioned named database (`R.string.firestore_database_id`) and hardened per-user security rules in `firestore.rules`.
 
 ## 2. Secure ElevenLabs Voice Backend Setup
-ElevenLabs API keys are **never** stored in the Android APK. All ElevenLabs Text-to-Speech streaming and Scribe Speech-to-Text requests route through the Node.js Express proxy in `/backend`:
+ElevenLabs API keys are **never** stored in the Android APK. All ElevenLabs Text-to-Speech streaming and Scribe Speech-to-Text requests route through the Node.js Express proxy in `/backend` and are verified via Firebase App Check (`X-Firebase-AppCheck`) or Firebase Auth Bearer tokens:
 ```bash
 cd backend
 npm install

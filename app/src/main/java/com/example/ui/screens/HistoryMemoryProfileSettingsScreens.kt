@@ -27,7 +27,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
-import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Delete
@@ -194,12 +193,12 @@ fun HistoryScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (isGuestSession) "Cloud Sync (Disabled in Guest Mode)" else "Cloud Synchronization",
+                        text = if (isGuestSession) "Local Storage (On Device)" else "Cloud Synchronization",
                         style = MaterialTheme.typography.labelLarge,
                         color = TextPrimary
                     )
                     Text(
-                        text = if (isGuestSession) "Guest / Testing uses temporary local storage only. Sign in with Google for cloud backup."
+                        text = if (isGuestSession) "Conversations are saved privately on this device."
                         else "Sync conversation threads to your Firestore account",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
@@ -407,7 +406,7 @@ fun MemoryScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Long-Term Memory", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
                             Text(
-                                text = if (isGuestSession) "Guest / Testing: saved locally only (cloud memory disabled)."
+                                text = if (isGuestSession) "Saved privately on this device. When off, SAATHI only sees the current chat."
                                 else "When off, SAATHI only sees the current chat.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextSecondary
@@ -551,7 +550,7 @@ fun SettingsScreen(
             SettingsRowItem(
                 icon = Icons.Default.Person,
                 title = "Profile",
-                subtitle = "Account, preferred name & cloud sync",
+                subtitle = "Preferred name, voice & privacy",
                 testTag = "settings_profile",
                 onClick = onOpenProfile
             )
@@ -673,7 +672,6 @@ fun ProfileScreen(
     onToggleCloudSync: (Boolean) -> Unit,
     onOpenLanguageSelect: () -> Unit,
     onOpenVoiceSelect: () -> Unit,
-    onSignOut: () -> Unit,
     onDeleteAccount: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -686,10 +684,19 @@ fun ProfileScreen(
         AlertDialog(
             onDismissRequest = { showDeleteConfirm = false },
             containerColor = CharcoalSurface,
-            title = { Text("Delete Account & Data?", color = CrimsonRose) },
+            title = {
+                Text(
+                    text = if (isGuestSession) "Clear Local Data?" else "Delete Account & Data?",
+                    color = CrimsonRose
+                )
+            },
             text = {
                 Text(
-                    "This permanently deletes your cloud conversations, saved memories, profile, and local cache.",
+                    text = if (isGuestSession) {
+                        "This permanently clears your saved conversations, memories, and local preferences on this device."
+                    } else {
+                        "This permanently deletes your cloud conversations, saved memories, profile, and local cache."
+                    },
                     color = TextSecondary
                 )
             },
@@ -698,7 +705,11 @@ fun ProfileScreen(
                     showDeleteConfirm = false
                     onDeleteAccount()
                 }) {
-                    Text("Delete Everything", color = CrimsonRose, fontWeight = FontWeight.Bold)
+                    Text(
+                        text = if (isGuestSession) "Clear Everything" else "Delete Everything",
+                        color = CrimsonRose,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             },
             dismissButton = {
@@ -726,7 +737,7 @@ fun ProfileScreen(
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = TextPrimary)
                 }
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Profile & Account", style = MaterialTheme.typography.headlineMedium, color = TextPrimary)
+                Text("Profile", style = MaterialTheme.typography.headlineMedium, color = TextPrimary)
             }
 
             SaathiGlassCard(modifier = Modifier.fillMaxWidth()) {
@@ -759,7 +770,7 @@ fun ProfileScreen(
                     Spacer(modifier = Modifier.width(14.dp))
                     Column {
                         Text(displayName.ifBlank { "SAATHI Friend" }, style = MaterialTheme.typography.titleLarge, color = TextPrimary)
-                        Text(email.ifBlank { "Google Account" }, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
+                        Text(email.ifBlank { "Private on-device profile" }, style = MaterialTheme.typography.bodyMedium, color = TextSecondary)
                     }
                 }
             }
@@ -820,12 +831,12 @@ fun ProfileScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (isGuestSession) "Cloud Sync (Requires Sign-In)" else "Cloud Sync",
+                                text = if (isGuestSession) "Local Privacy Mode" else "Cloud Sync",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = TextPrimary
                             )
                             Text(
-                                text = if (isGuestSession) "Disabled in temporary Guest / Testing mode" else "Sync profile, memories & chats to Firestore",
+                                text = if (isGuestSession) "Chats & memories stay privately on this device" else "Sync profile, memories & chats to Firestore",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
@@ -837,22 +848,6 @@ fun ProfileScreen(
                         )
                     }
                 }
-            }
-
-            OutlinedButton(
-                onClick = onSignOut,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp)
-                    .testTag("sign_out_button"),
-                shape = RoundedCornerShape(25.dp)
-            ) {
-                Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, tint = TextPrimary)
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = if (isGuestSession) "Exit Guest Mode / Sign In with Google" else "Sign Out",
-                    color = TextPrimary
-                )
             }
 
             OutlinedButton(
@@ -869,7 +864,7 @@ fun ProfileScreen(
                 Text(
                     text = when {
                         isDeleting -> "Clearing..."
-                        isGuestSession -> "Clear Local Guest Data"
+                        isGuestSession -> "Clear Local Data"
                         else -> "Delete Account & Data"
                     },
                     color = CrimsonRose

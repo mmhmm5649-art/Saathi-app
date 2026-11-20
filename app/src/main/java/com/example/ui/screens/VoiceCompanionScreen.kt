@@ -53,6 +53,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -114,7 +115,7 @@ fun VoiceCompanionScreen(
     onDismissError: () -> Unit,
     onVoiceScreenReady: (Boolean) -> Unit = {},
     onMicPermissionResult: (Boolean) -> Unit = {},
-    onExitGuest: (() -> Unit)? = null
+    onVoiceScreenDisposed: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showMicRationale by remember { mutableStateOf(false) }
@@ -128,6 +129,12 @@ fun VoiceCompanionScreen(
 
     LaunchedEffect(uiState.activeConversationId, preferences.autoStartConversation) {
         onVoiceScreenReady(hasMicPermNow())
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            onVoiceScreenDisposed()
+        }
     }
 
     val micPermissionLauncher = rememberLauncherForActivityResult(
@@ -290,7 +297,6 @@ fun VoiceCompanionScreen(
                     uiState.voiceSessionState == VoiceSessionState.INTERRUPTED -> WarmAmber to "Interrupted — Tap to talk"
                     uiState.voiceSessionState == VoiceSessionState.ENDED -> TextSecondary to "Conversation ended"
                     uiState.voiceSessionState == VoiceSessionState.ERROR -> CrimsonRose to "Attention needed"
-                    uiState.isGuestSession -> WarmAmber to "Guest / Testing"
                     else -> OnlineGreen to "Online"
                 }
                 Box(
@@ -308,21 +314,6 @@ fun VoiceCompanionScreen(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false)
                 )
-                if (uiState.isGuestSession && onExitGuest != null) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "Sign In",
-                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-                        color = SoftBlue,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(CharcoalSurface.copy(alpha = 0.8f))
-                            .border(1.dp, SoftBlue.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
-                            .clickable(onClick = onExitGuest)
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
-                            .testTag("guest_sign_in_chip")
-                    )
-                }
                 Spacer(modifier = Modifier.width(10.dp))
                 Text(
                     text = "${preferences.selectedVoiceGender.displayName} • ${preferences.preferredLanguage.isoCode.uppercase()}",

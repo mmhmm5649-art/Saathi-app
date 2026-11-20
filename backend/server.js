@@ -3,6 +3,7 @@ const path = require("node:path");
 const express = require("express");
 const multer = require("multer");
 const admin = require("firebase-admin");
+const { createFirebaseAuthMiddleware } = require("./authMiddleware");
 const { createVoiceService } = require("./voiceService");
 
 function loadBackendEnvFile() {
@@ -44,19 +45,10 @@ app.use(express.json({ limit: "1mb" }));
 const voiceService = createVoiceService();
 const PORT = process.env.PORT || 8080;
 
-async function requireFirebaseAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  if (!header.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing Firebase Auth Bearer token" });
-  }
-  const idToken = header.slice(7).trim();
-  try {
-    req.user = await admin.auth().verifyIdToken(idToken);
-    next();
-  } catch (err) {
-    return res.status(401).json({ error: "Invalid or expired Firebase Auth token" });
-  }
-}
+const requireFirebaseAuth = createFirebaseAuthMiddleware({
+  verifyIdToken: (token) => admin.auth().verifyIdToken(token),
+  verifyAppCheckToken: (token) => admin.appCheck().verifyToken(token),
+});
 
 app.get("/health", async (_req, res) => {
   const [config, models] = await Promise.all([
@@ -222,5 +214,7 @@ if (require.main === module) {
     console.log(`SAATHI Voice Backend listening on port ${PORT}`);
   });
 }
+
+app.createFirebaseAuthMiddleware = createFirebaseAuthMiddleware;
 
 module.exports = app;
