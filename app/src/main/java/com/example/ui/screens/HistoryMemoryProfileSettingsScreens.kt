@@ -193,23 +193,16 @@ fun HistoryScreen(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = if (isGuestSession) "Local Storage (On Device)" else "Cloud Synchronization",
+                        text = "Local Storage (On Device)",
                         style = MaterialTheme.typography.labelLarge,
                         color = TextPrimary
                     )
                     Text(
-                        text = if (isGuestSession) "Conversations are saved privately on this device."
-                        else "Sync conversation threads to your Firestore account",
+                        text = "Conversations are saved privately on this device.",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextSecondary
                     )
                 }
-                Switch(
-                    checked = !isGuestSession && cloudSyncEnabled,
-                    enabled = !isGuestSession,
-                    onCheckedChange = onToggleCloudSync,
-                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = ElectricViolet)
-                )
             }
 
             Spacer(modifier = Modifier.height(12.dp))
@@ -406,8 +399,7 @@ fun MemoryScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Long-Term Memory", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
                             Text(
-                                text = if (isGuestSession) "Saved privately on this device. When off, SAATHI only sees the current chat."
-                                else "When off, SAATHI only sees the current chat.",
+                                text = "Saved privately on this device (Room). When on, approved memories are included only as per-turn conversation context.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = TextSecondary
                             )
@@ -686,17 +678,13 @@ fun ProfileScreen(
             containerColor = CharcoalSurface,
             title = {
                 Text(
-                    text = if (isGuestSession) "Clear Local Data?" else "Delete Account & Data?",
+                    text = "Clear Local Data?",
                     color = CrimsonRose
                 )
             },
             text = {
                 Text(
-                    text = if (isGuestSession) {
-                        "This permanently clears your saved conversations, memories, and local preferences on this device."
-                    } else {
-                        "This permanently deletes your cloud conversations, saved memories, profile, and local cache."
-                    },
+                    text = "This permanently clears your saved conversations, memories, and local preferences on this device.",
                     color = TextSecondary
                 )
             },
@@ -706,7 +694,7 @@ fun ProfileScreen(
                     onDeleteAccount()
                 }) {
                     Text(
-                        text = if (isGuestSession) "Clear Everything" else "Delete Everything",
+                        text = "Clear Everything",
                         color = CrimsonRose,
                         fontWeight = FontWeight.Bold
                     )
@@ -831,21 +819,16 @@ fun ProfileScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = if (isGuestSession) "Local Privacy Mode" else "Cloud Sync",
+                                text = "Local Privacy Mode",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = TextPrimary
                             )
                             Text(
-                                text = if (isGuestSession) "Chats & memories stay privately on this device" else "Sync profile, memories & chats to Firestore",
+                                text = "Chats & memories stay privately on this device (Room & DataStore)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
                         }
-                        Switch(
-                            checked = !isGuestSession && preferences.cloudSyncEnabled,
-                            enabled = !isGuestSession,
-                            onCheckedChange = onToggleCloudSync
-                        )
                     }
                 }
             }
@@ -862,11 +845,7 @@ fun ProfileScreen(
                 Icon(Icons.Default.DeleteForever, contentDescription = null, tint = CrimsonRose)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = when {
-                        isDeleting -> "Clearing..."
-                        isGuestSession -> "Clear Local Data"
-                        else -> "Delete Account & Data"
-                    },
+                    text = if (isDeleting) "Clearing..." else "Clear Local Data",
                     color = CrimsonRose
                 )
             }

@@ -1,11 +1,5 @@
 package com.example.model
 
-import com.google.firebase.Timestamp
-import com.google.firebase.firestore.DocumentId
-import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.IgnoreExtraProperties
-import com.google.firebase.firestore.ServerTimestamp
-
 enum class SaathiLanguage(
     val displayName: String,
     val nativeName: String,
@@ -506,73 +500,4 @@ object SaathiVoiceCatalog {
 data class MemorySuggestion(
     val category: String,
     val content: String
-)
-
-@IgnoreExtraProperties
-data class UserProfileDoc(
-    @DocumentId val id: String = "",
-    val userId: String = "",
-    val displayName: String = "",
-    val preferredName: String? = null,
-    val photoUrl: String? = null,
-    val preferredLanguage: String = SaathiLanguage.ENGLISH.name,
-    val selectedVoiceId: String = SaathiVoiceCatalog.SLOT_FEMALE,
-    val selectedVoiceGender: String = VoiceGender.FEMALE.name,
-    val speechSpeed: Double = 1.0,
-    val speechVolume: Double = 1.0,
-    val autoPlayVoice: Boolean = true,
-    val memoryEnabled: Boolean = true,
-    val cloudSyncEnabled: Boolean = true,
-    val dailyRemindersEnabled: Boolean = false,
-    @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
-) {
-    fun toCreateMap(): Map<String, Any> = mapOf(
-        "userId" to userId,
-        "displayName" to displayName.ifBlank { "Friend" }.take(80),
-        "preferredName" to preferredName?.take(60),
-        "photoUrl" to photoUrl?.take(500),
-        "preferredLanguage" to preferredLanguage,
-        "selectedVoiceId" to selectedVoiceId,
-        "selectedVoiceGender" to selectedVoiceGender,
-        "speechSpeed" to speechSpeed.coerceIn(0.5, 2.0),
-        "speechVolume" to speechVolume.coerceIn(0.0, 1.0),
-        "autoPlayVoice" to autoPlayVoice,
-        "memoryEnabled" to memoryEnabled,
-        "cloudSyncEnabled" to cloudSyncEnabled,
-        "dailyRemindersEnabled" to dailyRemindersEnabled,
-        "createdAt" to FieldValue.serverTimestamp(),
-        "updatedAt" to FieldValue.serverTimestamp()
-    ).filterValues { it != null }.mapValues { it.value!! }
-}
-
-@IgnoreExtraProperties
-data class MemoryDoc(
-    @DocumentId val id: String = "",
-    val userId: String = "",
-    val category: String = "Context",
-    val content: String = "",
-    @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
-)
-
-@IgnoreExtraProperties
-data class ConversationDoc(
-    @DocumentId val id: String = "",
-    val userId: String = "",
-    val title: String = "",
-    val languageCode: String = SaathiLanguage.ENGLISH.name,
-    val lastMessagePreview: String = "",
-    @ServerTimestamp val createdAt: Timestamp? = null,
-    @ServerTimestamp val updatedAt: Timestamp? = null
-)
-
-@IgnoreExtraProperties
-data class MessageDoc(
-    @DocumentId val id: String = "",
-    val userId: String = "",
-    val role: String = "user",
-    val text: String = "",
-    val isVoice: Boolean = false,
-    @ServerTimestamp val createdAt: Timestamp? = null
 )

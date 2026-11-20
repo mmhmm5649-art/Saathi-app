@@ -6,40 +6,52 @@ import com.example.data.local.MessageEntity
 import com.example.model.MemorySuggestion
 import com.example.model.SaathiLanguage
 import com.example.model.SaathiVoiceCatalog
-import com.google.firebase.Firebase
-import com.google.firebase.ai.GenerativeModel
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.Content
-import com.google.firebase.ai.type.GenerativeBackend
-import com.google.firebase.ai.type.RequestOptions
-import com.google.firebase.ai.type.RequestTimeoutException
-import com.google.firebase.ai.type.Schema
-import com.google.firebase.ai.type.ThinkingLevel
-import com.google.firebase.ai.type.content
-import com.google.firebase.ai.type.generationConfig
-import com.google.firebase.ai.type.thinkingConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.Call
+import okhttp3.ConnectionPool
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
+import java.net.SocketTimeoutException
+import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+
+internal enum class CompanionThinkingLevel {
+    LOW,
+    MINIMAL
+}
+
+internal data class CompanionTurn(
+    val role: String,
+    val text: String
+)
 
 internal data class CompanionStreamRequest(
+    val backendUrl: String,
     val modelName: String,
-    val thinkingLevel: ThinkingLevel,
+    val thinkingLevel: CompanionThinkingLevel,
     val requestTimeoutMs: Long,
     val systemInstruction: String,
-    val history: List<Content>,
+    val history: List<CompanionTurn>,
     val userMessage: String,
-    val maxOutputTokens: Int
+    val maxOutputTokens: Int,
+    val languageCode: String
 )
 
 internal fun interface CompanionStreamTransport {
@@ -48,85 +60,170 @@ internal fun interface CompanionStreamTransport {
 
 class SaathiAiRepository internal constructor(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val backendUrlProvider: () -> String = { "" },
+    private val clientTokenProvider: () -> String = { "" },
     private val primaryAttemptTimeoutMs: Long = PRIMARY_ATTEMPT_TIMEOUT_MS,
     private val fallbackAttemptTimeoutMs: Long = FALLBACK_ATTEMPT_TIMEOUT_MS,
     private val totalTimeoutMs: Long = TOTAL_TIMEOUT_MS,
     private val customTransport: CompanionStreamTransport? = null,
     private val customMemoryExtractor: (suspend (String) -> String?)? = null,
+    private val httpClient: OkHttpClient = SHARED_AI_HTTP_CLIENT,
     private val nanoClock: () -> Long = { System.nanoTime() }
 ) {
-    constructor() : this(ioDispatcher = Dispatchers.IO)
-
-    private data class ModelCacheKey(
-        val modelName: String,
-        val language: SaathiLanguage,
-        val isVoiceMode: Boolean
+    constructor(
+        backendUrlProvider: () -> String = { "" },
+        clientTokenProvider: () -> String = { "" }
+    ) : this(
+        ioDispatcher = Dispatchers.IO,
+        backendUrlProvider = backendUrlProvider,
+        clientTokenProvider = clientTokenProvider
     )
 
-    private val ai by lazy {
-        Firebase.ai(backend = GenerativeBackend.googleAI())
-    }
-
-    private val companionModelCache = ConcurrentHashMap<ModelCacheKey, GenerativeModel>()
     private val systemInstructionCache = ConcurrentHashMap<Pair<SaathiLanguage, Boolean>, String>()
+    private val activeCalls: MutableSet<Call> = ConcurrentHashMap.newKeySet()
 
-    private val memorySchema by lazy {
-        Schema.obj(
-            properties = mapOf(
-                "shouldSuggest" to Schema.boolean(
-                    description = "True only if user shared a genuinely useful personal fact worth saving as a long-term memory."
-                ),
-                "category" to Schema.string(
-                    description = "One of: Name, Interest, Project, Preference, Context"
-                ),
-                "content" to Schema.string(
-                    description = "Short, clean third-person or factual note under 120 chars"
-                )
-            )
-        )
+    fun cancelActiveRequests() {
+        val snapshot = activeCalls.toList()
+        activeCalls.clear()
+        snapshot.forEach { runCatching { it.cancel() } }
     }
 
-    private val memoryExtractorModel by lazy {
-        ai.generativeModel(
-            modelName = FAST_MODEL_NAME,
-            generationConfig = generationConfig {
-                responseMimeType = "application/json"
-                responseSchema = memorySchema
-                thinkingConfig = thinkingConfig {
-                    thinkingLevel = ThinkingLevel.MINIMAL
-                }
-            },
-            requestOptions = RequestOptions(MEMORY_TIMEOUT_MS)
-        )
+    private fun validateBackendUrl(rawUrl: String): String {
+        val clean = rawUrl.trim().trimEnd('/')
+        if (clean.isBlank()) {
+            throw IllegalStateException(BACKEND_NOT_CONFIGURED_MESSAGE)
+        }
+        val uri = runCatching { URI(clean) }.getOrNull()
+            ?: throw IllegalStateException("Backend URL is invalid. Enter a valid HTTPS URL in Voice & Backend Settings.")
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val host = uri.host?.lowercase().orEmpty()
+        val isLocalLoopback = host == "127.0.0.1" || host == "localhost" || host == "10.0.2.2"
+        if (scheme != "https" && !(scheme == "http" && isLocalLoopback)) {
+            throw IllegalStateException(
+                "For your security, SAATHI requires an HTTPS backend URL (https://...)."
+            )
+        }
+        return clean
+    }
+
+    private fun Request.Builder.withClientHeaders(): Request.Builder {
+        addHeader("X-Saathi-Client", "saathi-android")
+        val token = clientTokenProvider().trim()
+        if (token.isNotBlank()) {
+            addHeader("X-Saathi-Client-Token", token)
+        }
+        return this
     }
 
     private val defaultTransport = CompanionStreamTransport { request ->
         flow {
-            val cacheKey = ModelCacheKey(
-                modelName = request.modelName,
-                language = SaathiLanguage.entries.firstOrNull {
-                    request.systemInstruction.contains(it.displayName, ignoreCase = true)
-                } ?: SaathiLanguage.ENGLISH,
-                isVoiceMode = request.maxOutputTokens <= VOICE_MAX_OUTPUT_TOKENS
-            )
-            val model = companionModelCache.getOrPut(cacheKey) {
-                ai.generativeModel(
-                    modelName = request.modelName,
-                    systemInstruction = content { text(request.systemInstruction) },
-                    generationConfig = generationConfig {
-                        maxOutputTokens = request.maxOutputTokens
-                        thinkingConfig = thinkingConfig {
-                            thinkingLevel = request.thinkingLevel
+            val baseUrl = validateBackendUrl(request.backendUrl)
+            val payload = JSONObject().apply {
+                put("modelName", request.modelName)
+                put("thinkingLevel", request.thinkingLevel.name)
+                put("systemInstruction", request.systemInstruction)
+                put("userMessage", request.userMessage)
+                put("maxOutputTokens", request.maxOutputTokens)
+                put("languageCode", request.languageCode)
+                put(
+                    "history",
+                    JSONArray().apply {
+                        request.history.forEach { turn ->
+                            put(
+                                JSONObject().apply {
+                                    put("role", turn.role)
+                                    put("text", turn.text)
+                                }
+                            )
                         }
-                    },
-                    requestOptions = RequestOptions(request.requestTimeoutMs)
+                    }
                 )
-            }
-            val chat = model.startChat(history = request.history)
-            chat.sendMessageStream(request.userMessage).collect { chunk ->
-                val piece = chunk.text.orEmpty()
-                if (piece.isNotEmpty()) {
-                    emit(piece)
+            }.toString()
+
+            val attemptClient = httpClient.newBuilder()
+                .readTimeout(request.requestTimeoutMs.coerceAtLeast(1_000L), TimeUnit.MILLISECONDS)
+                .callTimeout((request.requestTimeoutMs + 4_000L).coerceAtLeast(2_000L), TimeUnit.MILLISECONDS)
+                .build()
+
+            var attempt = 0
+            while (true) {
+                val httpRequest = Request.Builder()
+                    .url("$baseUrl/v1/chat/stream")
+                    .withClientHeaders()
+                    .addHeader("Accept", "text/event-stream")
+                    .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+                    .build()
+
+                val call = attemptClient.newCall(httpRequest)
+                activeCalls.add(call)
+                try {
+                    call.execute().use { response ->
+                        if (!response.isSuccessful) {
+                            val code = response.code
+                            val retryAfter = response.header("Retry-After")
+                            val rawErr = response.body?.string().orEmpty().take(280)
+                            val serverErr = runCatching { JSONObject(rawErr).optString("error", "") }.getOrDefault("")
+
+                            val transient = code == 429 || code in 500..504
+                            if (transient && attempt < MAX_NETWORK_RETRIES && !call.isCanceled()) {
+                                val waitMs = computeRetryDelayMs(attempt, retryAfter)
+                                attempt++
+                                delay(waitMs)
+                                return@use
+                            }
+
+                            if (code == 504) {
+                                throw SocketTimeoutException(serverErr.ifBlank { "Backend Gemini request timed out." })
+                            }
+                            if (code == 429 || code in 500..503) {
+                                throw TransientBackendException(code, friendlyHttpError(code, serverErr))
+                            }
+                            throw IllegalStateException(friendlyHttpError(code, serverErr))
+                        }
+
+                        val body = response.body
+                            ?: throw IOException("Empty response body from SAATHI backend.")
+
+                        val reader = body.charStream().buffered()
+                        while (currentCoroutineContext().isActive) {
+                            val line = reader.readLine() ?: break
+                            val trimmed = line.trim()
+                            if (!trimmed.startsWith("data:")) continue
+                            val dataPayload = trimmed.removePrefix("data:").trim()
+                            if (dataPayload.isEmpty() || dataPayload == "[DONE]") continue
+                            val json = runCatching { JSONObject(dataPayload) }.getOrNull() ?: continue
+                            val errMsg = json.optString("error", "").trim()
+                            if (errMsg.isNotEmpty()) {
+                                throw IllegalStateException(errMsg)
+                            }
+                            val piece = json.optString("text", "")
+                            if (piece.isNotEmpty()) {
+                                emit(piece)
+                            }
+                            if (json.optBoolean("done", false)) {
+                                break
+                            }
+                        }
+                        return@flow
+                    }
+                } catch (e: CancellationException) {
+                    call.cancel()
+                    throw e
+                } catch (e: SocketTimeoutException) {
+                    throw e
+                } catch (e: IOException) {
+                    if (call.isCanceled()) {
+                        throw CancellationException("Gemini streaming request cancelled.")
+                    }
+                    if (attempt < MAX_NETWORK_RETRIES) {
+                        val waitMs = computeRetryDelayMs(attempt, null)
+                        attempt++
+                        delay(waitMs)
+                        continue
+                    }
+                    throw e
+                } finally {
+                    activeCalls.remove(call)
                 }
             }
         }
@@ -140,6 +237,7 @@ class SaathiAiRepository internal constructor(
         memories: List<MemoryEntity>,
         memoryEnabled: Boolean,
         isVoiceMode: Boolean,
+        backendUrl: String = backendUrlProvider(),
         onRequestStarted: (Long) -> Unit = {},
         onFirstToken: (Long) -> Unit = {},
         onCompleted: (Long) -> Unit = {}
@@ -164,13 +262,15 @@ class SaathiAiRepository internal constructor(
         try {
             withTimeout(totalTimeoutMs) {
                 val primaryRequest = CompanionStreamRequest(
+                    backendUrl = backendUrl,
                     modelName = PRIMARY_MODEL_NAME,
-                    thinkingLevel = ThinkingLevel.LOW,
+                    thinkingLevel = CompanionThinkingLevel.LOW,
                     requestTimeoutMs = primaryAttemptTimeoutMs,
                     systemInstruction = systemInstruction,
-                    history = normalized.historyContents,
+                    history = normalized.historyTurns,
                     userMessage = normalized.effectivePrompt,
-                    maxOutputTokens = maxTokens
+                    maxOutputTokens = maxTokens,
+                    languageCode = language.isoCode
                 )
 
                 onRequestStarted(nanoClock())
@@ -206,16 +306,20 @@ class SaathiAiRepository internal constructor(
                     }
                     Log.w(TAG, "Primary model $PRIMARY_MODEL_NAME timed out before first token; trying $FAST_MODEL_NAME", e)
                     shouldTryFallback = true
-                } catch (e: RequestTimeoutException) {
+                } catch (e: SocketTimeoutException) {
                     if (accumulated.isNotEmpty()) throw e
                     Log.w(TAG, "Primary HTTP request timed out on $PRIMARY_MODEL_NAME; trying $FAST_MODEL_NAME", e)
+                    shouldTryFallback = true
+                } catch (e: TransientBackendException) {
+                    if (accumulated.isNotEmpty()) throw e
+                    Log.w(TAG, "Primary model transient error (${e.code}); trying $FAST_MODEL_NAME", e)
                     shouldTryFallback = true
                 }
 
                 if (shouldTryFallback) {
                     val fallbackRequest = primaryRequest.copy(
                         modelName = FAST_MODEL_NAME,
-                        thinkingLevel = ThinkingLevel.MINIMAL,
+                        thinkingLevel = CompanionThinkingLevel.MINIMAL,
                         requestTimeoutMs = fallbackAttemptTimeoutMs
                     )
                     withTimeout(fallbackAttemptTimeoutMs) {
@@ -252,11 +356,14 @@ class SaathiAiRepository internal constructor(
         } catch (e: TimeoutCancellationException) {
             Log.e(TAG, "Gemini streaming timed out", e)
             throw IllegalStateException(TIMEOUT_USER_MESSAGE, e)
-        } catch (e: RequestTimeoutException) {
-            Log.e(TAG, "Gemini streaming request timed out", e)
+        } catch (e: SocketTimeoutException) {
+            Log.e(TAG, "Gemini HTTP streaming timed out", e)
             throw IllegalStateException(TIMEOUT_USER_MESSAGE, e)
         } catch (e: CancellationException) {
             throw e
+        } catch (e: TransientBackendException) {
+            Log.e(TAG, "Gemini backend transient failure", e)
+            throw IllegalStateException(e.message ?: "SAATHI backend is temporarily busy. Please try again.", e)
         } catch (e: Exception) {
             Log.e(TAG, "Gemini streaming failed", e)
             throw e
@@ -265,7 +372,8 @@ class SaathiAiRepository internal constructor(
 
     suspend fun extractMemoryCandidate(
         userMessage: String,
-        existingMemories: List<MemoryEntity>
+        existingMemories: List<MemoryEntity>,
+        backendUrl: String = backendUrlProvider()
     ): MemorySuggestion? {
         if (userMessage.length < 10) return null
         val existingSummary = existingMemories.take(20).joinToString("; ") { it.content }
@@ -285,7 +393,7 @@ class SaathiAiRepository internal constructor(
                     if (customMemoryExtractor != null) {
                         customMemoryExtractor.invoke(prompt)
                     } else {
-                        memoryExtractorModel.generateContent(prompt).text
+                        fetchMemoryExtractionFromBackend(backendUrl, prompt)
                     }
                 }
             } ?: return null
@@ -303,8 +411,49 @@ class SaathiAiRepository internal constructor(
         }
     }
 
+    private fun fetchMemoryExtractionFromBackend(rawBackendUrl: String, prompt: String): String? {
+        val cleanUrl = rawBackendUrl.trim().trimEnd('/')
+        if (cleanUrl.isBlank()) return null
+        val validatedUrl = validateBackendUrl(cleanUrl)
+        val payload = JSONObject().put("prompt", prompt).toString()
+        val request = Request.Builder()
+            .url("$validatedUrl/v1/memory/extract")
+            .withClientHeaders()
+            .post(payload.toRequestBody(JSON_MEDIA_TYPE))
+            .build()
+        val call = httpClient.newCall(request)
+        activeCalls.add(call)
+        return try {
+            call.execute().use { resp ->
+                if (!resp.isSuccessful) null else resp.body?.string()
+            }
+        } finally {
+            activeCalls.remove(call)
+        }
+    }
+
+    private fun computeRetryDelayMs(attempt: Int, retryAfterHeader: String?): Long {
+        val headerSecs = retryAfterHeader?.trim()?.toDoubleOrNull()
+        if (headerSecs != null && headerSecs > 0.0) {
+            return (headerSecs * 1000.0).toLong().coerceIn(300L, 4_000L)
+        }
+        return if (attempt == 0) 450L else 1_100L
+    }
+
+    private fun friendlyHttpError(code: Int, serverMessage: String): String = when (code) {
+        400 -> serverMessage.ifBlank { "Invalid request sent to SAATHI backend." }
+        401 -> "Backend authorization failed (HTTP 401). Check your backend access configuration."
+        426 -> "HTTPS is required by your SAATHI backend. Use an https:// URL."
+        429 -> "SAATHI is busy right now (rate limit). Please wait a moment and try again."
+        503 -> serverMessage.ifBlank { "Gemini AI service is not configured on the backend server (missing GEMINI_API_KEY)." }
+        504 -> "SAATHI took too long to reply. Please try again."
+        else -> serverMessage.ifBlank { "SAATHI couldn't reach your backend (HTTP $code). Please try again." }
+    }
+
+    private class TransientBackendException(val code: Int, message: String) : IOException(message)
+
     internal data class NormalizedConversation(
-        val historyContents: List<Content>,
+        val historyTurns: List<CompanionTurn>,
         val effectivePrompt: String
     )
 
@@ -316,14 +465,14 @@ class SaathiAiRepository internal constructor(
     ): NormalizedConversation {
         val cleaned = mutableListOf<Pair<String, String>>()
 
-        // Inject lightweight per-turn profile/memory context cleanly so cached GenerativeModels stay valid
+        // Inject lightweight per-turn local profile/memory context cleanly (distinct from permanent on-device Room storage)
         val contextLines = buildList {
             if (preferredName.isNotBlank()) {
                 add("User preferred name: \"$preferredName\".")
             }
             if (memories.isNotEmpty()) {
                 add(
-                    "Active memories (reference naturally only when helpful, never invent others): " +
+                    "Active local memories (reference naturally only when helpful, never invent others): " +
                         memories.take(15).joinToString("; ") { "[${it.category}] ${it.content}" }
                 )
             }
@@ -369,8 +518,7 @@ class SaathiAiRepository internal constructor(
             }
         }
 
-        // If the trailing turn in history is already a "user" message (e.g., unanswered/retried prompt),
-        // fold or deduplicate so sendMessageStream(effectivePrompt) preserves strict user/model alternation.
+        // Fold/deduplicate trailing user message so strict user/model alternation is preserved
         var effectivePrompt = userMessage.trim()
         val trailing = cleaned.lastOrNull()
         if (trailing != null && trailing.first == "user") {
@@ -380,10 +528,8 @@ class SaathiAiRepository internal constructor(
             }
         }
 
-        val contents = cleaned.map { (role, text) ->
-            content(role) { text(text) }
-        }
-        return NormalizedConversation(contents, effectivePrompt)
+        val turns = cleaned.map { (role, text) -> CompanionTurn(role = role, text = text) }
+        return NormalizedConversation(turns, effectivePrompt)
     }
 
     private fun buildBaseSystemInstruction(
@@ -471,8 +617,8 @@ class SaathiAiRepository internal constructor(
 
     internal companion object {
         const val TAG = "SaathiAiRepository"
-        const val PRIMARY_MODEL_NAME = "gemini-3.8-flash"
-        const val FAST_MODEL_NAME = "gemini-3.5-flash-lite"
+        const val PRIMARY_MODEL_NAME = "gemini-2.5-flash"
+        const val FAST_MODEL_NAME = "gemini-2.5-flash-lite"
         const val VOICE_MAX_OUTPUT_TOKENS = 256
         const val TEXT_MAX_OUTPUT_TOKENS = 512
         const val MAX_RECENT_MESSAGES = 14
@@ -481,7 +627,21 @@ class SaathiAiRepository internal constructor(
         const val FALLBACK_ATTEMPT_TIMEOUT_MS = 25_000L
         const val TOTAL_TIMEOUT_MS = 60_000L
         const val MEMORY_TIMEOUT_MS = 20_000L
+        const val MAX_NETWORK_RETRIES = 1
+        const val BACKEND_NOT_CONFIGURED_MESSAGE =
+            "SAATHI backend URL is not configured yet. Open Voice & Backend Settings and enter your HTTPS backend URL."
         const val TIMEOUT_USER_MESSAGE =
             "Response timed out after 60 seconds. Check your internet connection and tap retry."
+
+        private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+
+        private val SHARED_AI_HTTP_CLIENT: OkHttpClient = OkHttpClient.Builder()
+            .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))
+            .retryOnConnectionFailure(true)
+            .connectTimeout(12, TimeUnit.SECONDS)
+            .readTimeout(35, TimeUnit.SECONDS)
+            .writeTimeout(15, TimeUnit.SECONDS)
+            .callTimeout(60, TimeUnit.SECONDS)
+            .build()
     }
 }

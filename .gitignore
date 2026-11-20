@@ -26,8 +26,5 @@ debug.keystore.base64
 *.keystore
 *.keystore.base64
 *service-account*.json
-*firebase-adminsdk*.json
-app/google-services.json
 .build-outputs/
 *-debug.log
-

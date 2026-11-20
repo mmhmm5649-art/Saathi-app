@@ -35,8 +35,8 @@ class VoiceBackendClientTest {
     private lateinit var baseUrl: String
     private val capturedTtsRequests = CopyOnWriteArrayList<JSONObject>()
     private val capturedTtsPaths = CopyOnWriteArrayList<String>()
-    private val capturedAppCheckHeaders = CopyOnWriteArrayList<String>()
-    private val capturedAuthHeaders = CopyOnWriteArrayList<String>()
+    private val capturedClientHeaders = CopyOnWriteArrayList<String>()
+    private val capturedClientTokens = CopyOnWriteArrayList<String>()
     private val scriptedTtsStatuses = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, String?>>()
     private val scriptedSttStatuses = java.util.concurrent.ConcurrentLinkedQueue<Pair<Int, String?>>()
     private val ttsRequestCounter = AtomicInteger(0)
@@ -56,6 +56,7 @@ class VoiceBackendClientTest {
         server.createContext("/health") { exchange ->
             val json = JSONObject().apply {
                 put("ok", true)
+                put("geminiConfigured", true)
                 put("elevenLabsConfigured", true)
                 put("ttsModel", "eleven_v4_turbo")
                 put("sttModel", "scribe_v3_live")
@@ -65,8 +66,8 @@ class VoiceBackendClientTest {
         }
 
         server.createContext("/v1/voices") { exchange ->
-            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
-            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client")?.let { capturedClientHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client-Token")?.let { capturedClientTokens.add(it) }
             val path = exchange.requestURI.path
             if (path.endsWith("/config") && exchange.requestMethod == "POST") {
                 val reqBody = JSONObject(exchange.requestBody.bufferedReader().readText())
@@ -110,8 +111,8 @@ class VoiceBackendClientTest {
         }
 
         val ttsHandler: (com.sun.net.httpserver.HttpExchange) -> Unit = { exchange ->
-            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
-            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client")?.let { capturedClientHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client-Token")?.let { capturedClientTokens.add(it) }
             ttsRequestCounter.incrementAndGet()
             capturedTtsPaths.add(exchange.requestURI.path)
             val body = JSONObject(exchange.requestBody.bufferedReader().readText())
@@ -138,8 +139,8 @@ class VoiceBackendClientTest {
         server.createContext("/v1/tts/preview", ttsHandler)
 
         server.createContext("/v1/stt") { exchange ->
-            exchange.requestHeaders.getFirst("X-Firebase-AppCheck")?.let { capturedAppCheckHeaders.add(it) }
-            exchange.requestHeaders.getFirst("Authorization")?.let { capturedAuthHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client")?.let { capturedClientHeaders.add(it) }
+            exchange.requestHeaders.getFirst("X-Saathi-Client-Token")?.let { capturedClientTokens.add(it) }
             sttRequestCounter.incrementAndGet()
             sttStartedLatch?.countDown()
             val delayMs = sttArtificialDelayMs.get()
@@ -183,11 +184,12 @@ class VoiceBackendClientTest {
     @Test
     fun `sample conversations in Telugu, Hindi, and English preview both voices and preserve selected voice identity`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
 
         val health = client.checkHealth(baseUrl)
         assertTrue(health is VoiceBackendResult.Success)
         assertTrue((health as VoiceBackendResult.Success).data.contains("eleven_v4_turbo"))
+        assertTrue(health.data.contains("Gemini"))
 
         // Fetch configurable Indian Male & Female voices from backend
         val voicesRes = client.fetchConfiguredVoices(baseUrl)
@@ -268,7 +270,7 @@ class VoiceBackendClientTest {
     @Test
     fun `openTtsAudioSource returns ProgressiveStream immediately with initialBytes for Telugu Hindi English`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
 
         for (lang in listOf(SaathiLanguage.TELUGU, SaathiLanguage.HINDI, SaathiLanguage.ENGLISH)) {
             val res = client.openTtsAudioSource(
@@ -297,7 +299,7 @@ class VoiceBackendClientTest {
     @Test
     fun `openTtsAudioSource retries HTTP 429 with Retry-After and HTTP 503 then succeeds`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
 
         scriptedTtsStatuses.add(429 to "0.3")
         scriptedTtsStatuses.add(503 to null)
@@ -321,7 +323,7 @@ class VoiceBackendClientTest {
     @Test
     fun `duplicate concurrent and sequential TTS requests coalesce and hit cache then invalidate on voice update`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
 
         // Concurrent identical synthesis calls must coalesce onto a single backend HTTP request
         val results = listOf(
@@ -395,7 +397,7 @@ class VoiceBackendClientTest {
     @Test
     fun `transcribeWithScribe retries transient HTTP 429 and recovers cleanly`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
 
         scriptedSttStatuses.add(429 to "0.3")
         val res = client.transcribeWithScribe(baseUrl, "RIFFWAVE".toByteArray(), SaathiLanguage.TELUGU)
@@ -408,7 +410,7 @@ class VoiceBackendClientTest {
     @Test
     fun `cancelActiveSttRequest cancels in-flight Scribe call cleanly`() = kotlinx.coroutines.runBlocking {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
-        val client = VoiceBackendClient(context = context, tokenProvider = { "test_firebase_id_token" })
+        val client = VoiceBackendClient(context = context, clientTokenProvider = { "test_saathi_client_token" })
         val latch = java.util.concurrent.CountDownLatch(1)
         sttStartedLatch = latch
         sttArtificialDelayMs.set(800)
@@ -433,12 +435,11 @@ class VoiceBackendClientTest {
     }
 
     @Test
-    fun `voice backend works without Google Sign-In using Firebase App Check header`() = runTest {
+    fun `voice backend works standalone with client headers and enforces HTTPS for remote hosts`() = runTest {
         val context = ApplicationProvider.getApplicationContext<android.content.Context>()
         val client = VoiceBackendClient(
             context = context,
-            tokenProvider = { null },
-            appCheckTokenProvider = { "valid_app_check_token_xyz" }
+            clientTokenProvider = { "standalone_client_token_xyz" }
         )
 
         val voicesRes = client.fetchConfiguredVoices(baseUrl)
@@ -446,7 +447,7 @@ class VoiceBackendClientTest {
 
         val ttsRes = client.synthesizeSpeechToCacheFile(
             baseUrl = baseUrl,
-            text = "Hello from local SAATHI companion",
+            text = "Hello from standalone SAATHI companion",
             voiceSlot = SaathiVoiceCatalog.SLOT_FEMALE,
             voiceId = configuredFemaleId,
             modelId = SaathiVoiceCatalog.DEFAULT_TTS_MODEL,
@@ -460,8 +461,13 @@ class VoiceBackendClientTest {
         val sttRes = client.transcribeWithScribe(baseUrl, "RIFFWAVE".toByteArray(), SaathiLanguage.ENGLISH)
         assertTrue(sttRes is VoiceBackendResult.Success)
 
-        assertTrue("Authorization header must not be sent when no Firebase Auth user exists", capturedAuthHeaders.isEmpty())
-        assertEquals(3, capturedAppCheckHeaders.size)
-        assertTrue(capturedAppCheckHeaders.all { it == "valid_app_check_token_xyz" })
+        assertEquals(3, capturedClientHeaders.size)
+        assertTrue(capturedClientHeaders.all { it == "saathi-android" })
+        assertEquals(3, capturedClientTokens.size)
+        assertTrue(capturedClientTokens.all { it == "standalone_client_token_xyz" })
+
+        val cleartextCheck = client.checkHealth("http://insecure-remote.example.com")
+        assertTrue(cleartextCheck is VoiceBackendResult.Error)
+        assertTrue((cleartextCheck as VoiceBackendResult.Error).message.contains("HTTPS", ignoreCase = true))
     }
 }

@@ -8,14 +8,10 @@ import com.example.model.SaathiLanguage
 import com.example.model.SaathiVoiceCatalog
 import com.example.model.VoiceGender
 import com.example.model.VoiceLibraryCandidate
-import com.google.firebase.Firebase
-import com.google.firebase.appcheck.FirebaseAppCheck
-import com.google.firebase.auth.auth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.ConnectionPool
@@ -31,6 +27,7 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.SocketTimeoutException
+import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
@@ -65,36 +62,11 @@ sealed interface TtsAudioSource {
 
 class VoiceBackendClient(
     private val context: Context,
-    private val tokenProvider: suspend () -> String? = {
-        try {
-            Firebase.auth.currentUser?.getIdToken(false)?.await()?.token
-        } catch (_: Exception) {
-            null
-        }
-    },
-    private val appCheckTokenProvider: suspend () -> String? = {
-        try {
-            FirebaseAppCheck.getInstance().getAppCheckToken(false).await().token
-        } catch (_: Exception) {
-            null
-        }
-    },
+    private val clientTokenProvider: suspend () -> String? = { null },
     private val nanoClock: () -> Long = { System.nanoTime() }
 ) {
 
     private val client = SHARED_HTTP_CLIENT
-
-    @Volatile
-    private var cachedIdToken: String? = null
-
-    @Volatile
-    private var cachedIdTokenAtNs: Long = 0L
-
-    @Volatile
-    private var cachedAppCheckToken: String? = null
-
-    @Volatile
-    private var cachedAppCheckTokenAtNs: Long = 0L
 
     private val activeTtsCalls: MutableSet<Call> = ConcurrentHashMap.newKeySet()
 
@@ -109,54 +81,30 @@ class VoiceBackendClient(
         val createdAtMs: Long
     )
 
-    private data class BackendAuthHeaders(
-        val idToken: String?,
-        val appCheckToken: String?
-    ) {
-        val hasAnyToken: Boolean
-            get() = !idToken.isNullOrBlank() || !appCheckToken.isNullOrBlank()
-    }
-
     private val ttsCacheDir: File by lazy {
         File(context.cacheDir, "saathi_tts_cache").apply { mkdirs() }
     }
 
-    private suspend fun resolveAuthToken(): String? {
-        val now = nanoClock()
-        val existing = cachedIdToken
-        if (!existing.isNullOrBlank() && (now - cachedIdTokenAtNs) < TOKEN_CACHE_TTL_NS) {
-            return existing
+    private fun validateBackendUrl(rawUrl: String): String? {
+        val cleanUrl = rawUrl.trim().trimEnd('/')
+        if (cleanUrl.isBlank()) return null
+        val uri = runCatching { URI(cleanUrl) }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase().orEmpty()
+        val host = uri.host?.lowercase().orEmpty()
+        val isLocalLoopback = host == "127.0.0.1" || host == "localhost" || host == "10.0.2.2"
+        return if (scheme == "https" || (scheme == "http" && isLocalLoopback)) {
+            cleanUrl
+        } else {
+            null
         }
-        val fresh = tokenProvider()
-        if (!fresh.isNullOrBlank()) {
-            cachedIdToken = fresh
-            cachedIdTokenAtNs = now
-        }
-        return fresh
     }
 
-    private suspend fun resolveAppCheckToken(): String? {
-        val now = nanoClock()
-        val existing = cachedAppCheckToken
-        if (!existing.isNullOrBlank() && (now - cachedAppCheckTokenAtNs) < TOKEN_CACHE_TTL_NS) {
-            return existing
+    private suspend fun Request.Builder.withStandaloneClientHeaders(): Request.Builder {
+        addHeader("X-Saathi-Client", "saathi-android")
+        val token = runCatching { clientTokenProvider()?.trim() }.getOrNull()
+        if (!token.isNullOrBlank()) {
+            addHeader("X-Saathi-Client-Token", token)
         }
-        val fresh = appCheckTokenProvider()
-        if (!fresh.isNullOrBlank()) {
-            cachedAppCheckToken = fresh
-            cachedAppCheckTokenAtNs = now
-        }
-        return fresh
-    }
-
-    private suspend fun resolveBackendAuthHeaders(): BackendAuthHeaders = BackendAuthHeaders(
-        idToken = resolveAuthToken()?.takeIf { it.isNotBlank() },
-        appCheckToken = resolveAppCheckToken()?.takeIf { it.isNotBlank() }
-    )
-
-    private fun Request.Builder.withBackendAuth(auth: BackendAuthHeaders): Request.Builder {
-        auth.idToken?.let { addHeader("Authorization", "Bearer $it") }
-        auth.appCheckToken?.let { addHeader("X-Firebase-AppCheck", it) }
         return this
     }
 
@@ -179,29 +127,38 @@ class VoiceBackendClient(
     }
 
     suspend fun checkHealth(baseUrl: String): VoiceBackendResult<String> = withContext(Dispatchers.IO) {
-        val cleanUrl = baseUrl.trim().trimEnd('/')
-        if (cleanUrl.isBlank()) {
+        val trimmed = baseUrl.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
             return@withContext VoiceBackendResult.NotConfigured(
-                "Enter your deployed SAATHI Voice Backend URL to enable ElevenLabs speech."
+                "Enter your deployed SAATHI Backend HTTPS URL to enable Gemini AI and ElevenLabs speech."
             )
         }
+        val cleanUrl = validateBackendUrl(trimmed)
+            ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
         try {
             val request = Request.Builder()
                 .url("$cleanUrl/health")
+                .withStandaloneClientHeaders()
                 .get()
                 .build()
             client.newCall(request).execute().use { response ->
                 val body = response.body?.string().orEmpty()
                 if (response.isSuccessful) {
                     val json = runCatching { JSONObject(body) }.getOrNull()
+                    val geminiConfigured = json?.optBoolean("geminiConfigured", true) ?: true
                     val elevenConfigured = json?.optBoolean("elevenLabsConfigured", false) ?: false
                     val ttsModel = json?.optString("ttsModel", SaathiVoiceCatalog.DEFAULT_TTS_MODEL)
                         ?: SaathiVoiceCatalog.DEFAULT_TTS_MODEL
                     val sttModel = json?.optString("sttModel", "scribe_v3_live") ?: "scribe_v3_live"
-                    if (elevenConfigured) {
-                        VoiceBackendResult.Success("Connected ($ttsModel • $sttModel)")
-                    } else {
-                        VoiceBackendResult.Error("Backend reachable, but ELEVENLABS_API_KEY is missing on the server.")
+                    when {
+                        geminiConfigured && elevenConfigured ->
+                            VoiceBackendResult.Success("Connected • Gemini + ElevenLabs ($ttsModel • $sttModel)")
+                        !geminiConfigured && !elevenConfigured ->
+                            VoiceBackendResult.Error("Backend reachable, but GEMINI_API_KEY and ELEVENLABS_API_KEY are missing on the server.")
+                        !geminiConfigured ->
+                            VoiceBackendResult.Error("Backend reachable, but GEMINI_API_KEY is missing on the server.")
+                        else ->
+                            VoiceBackendResult.Error("Backend reachable, but ELEVENLABS_API_KEY is missing on the server.")
                     }
                 } else {
                     VoiceBackendResult.Error("Backend returned HTTP ${response.code}.")
@@ -217,20 +174,18 @@ class VoiceBackendClient(
 
     suspend fun fetchConfiguredVoices(baseUrl: String): VoiceBackendResult<BackendVoicesPayload> =
         withContext(Dispatchers.IO) {
-            val cleanUrl = baseUrl.trim().trimEnd('/')
-            if (cleanUrl.isBlank()) {
+            val trimmed = baseUrl.trim().trimEnd('/')
+            if (trimmed.isBlank()) {
                 return@withContext VoiceBackendResult.NotConfigured(
-                    "Voice backend URL is not configured yet."
+                    "SAATHI backend URL is not configured yet."
                 )
             }
-            val authHeaders = resolveBackendAuthHeaders()
-            if (!authHeaders.hasAnyToken) {
-                return@withContext VoiceBackendResult.Error(AUTH_TOKEN_MISSING_MESSAGE)
-            }
+            val cleanUrl = validateBackendUrl(trimmed)
+                ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
 
             val request = Request.Builder()
                 .url("$cleanUrl/v1/voices")
-                .withBackendAuth(authHeaders)
+                .withStandaloneClientHeaders()
                 .get()
                 .build()
 
@@ -255,19 +210,17 @@ class VoiceBackendClient(
         gender: VoiceGender,
         query: String = ""
     ): VoiceBackendResult<List<VoiceLibraryCandidate>> = withContext(Dispatchers.IO) {
-        val cleanUrl = baseUrl.trim().trimEnd('/')
-        if (cleanUrl.isBlank()) {
-            return@withContext VoiceBackendResult.NotConfigured("Configure your Voice Backend URL first.")
+        val trimmed = baseUrl.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
+            return@withContext VoiceBackendResult.NotConfigured("Configure your SAATHI Backend HTTPS URL first.")
         }
-        val authHeaders = resolveBackendAuthHeaders()
-        if (!authHeaders.hasAnyToken) {
-            return@withContext VoiceBackendResult.Error(AUTH_TOKEN_MISSING_MESSAGE)
-        }
+        val cleanUrl = validateBackendUrl(trimmed)
+            ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
 
         val encodedSearch = URLEncoder.encode(query.trim(), "UTF-8")
         val request = Request.Builder()
             .url("$cleanUrl/v1/voices/library?gender=${gender.slotKey}&search=$encodedSearch")
-            .withBackendAuth(authHeaders)
+            .withStandaloneClientHeaders()
             .get()
             .build()
 
@@ -315,14 +268,12 @@ class VoiceBackendClient(
         voiceId: String,
         voiceName: String
     ): VoiceBackendResult<BackendVoicesPayload> = withContext(Dispatchers.IO) {
-        val cleanUrl = baseUrl.trim().trimEnd('/')
-        if (cleanUrl.isBlank()) {
-            return@withContext VoiceBackendResult.NotConfigured("Configure your Voice Backend URL first.")
+        val trimmed = baseUrl.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
+            return@withContext VoiceBackendResult.NotConfigured("Configure your SAATHI Backend HTTPS URL first.")
         }
-        val authHeaders = resolveBackendAuthHeaders()
-        if (!authHeaders.hasAnyToken) {
-            return@withContext VoiceBackendResult.Error(AUTH_TOKEN_MISSING_MESSAGE)
-        }
+        val cleanUrl = validateBackendUrl(trimmed)
+            ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
 
         val cleanVoiceId = SaathiVoiceCatalog.extractVoiceId(voiceId)
         val bodyJson = JSONObject().apply {
@@ -337,7 +288,7 @@ class VoiceBackendClient(
 
         val request = Request.Builder()
             .url("$cleanUrl/v1/voices/config")
-            .withBackendAuth(authHeaders)
+            .withStandaloneClientHeaders()
             .post(bodyJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
 
@@ -375,21 +326,18 @@ class VoiceBackendClient(
         onBackendResponseHeaders: (Long) -> Unit = {},
         onFirstAudioChunk: (Long) -> Unit = {}
     ): VoiceBackendResult<TtsAudioSource> = withContext(Dispatchers.IO) {
-        val cleanUrl = baseUrl.trim().trimEnd('/')
-        if (cleanUrl.isBlank()) {
+        val trimmed = baseUrl.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
             return@withContext VoiceBackendResult.NotConfigured(
-                "ElevenLabs secure voice backend is not configured yet. Configure your backend URL in Voice Settings to hear SAATHI speak."
+                "SAATHI secure backend is not configured yet. Configure your HTTPS backend URL in Voice Settings to hear SAATHI speak."
             )
         }
+        val cleanUrl = validateBackendUrl(trimmed)
+            ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
 
         val cleanText = SaathiVoiceCatalog.sanitizeSpeechText(text, language)
         if (cleanText.isBlank()) {
             return@withContext VoiceBackendResult.Error("Nothing to speak.")
-        }
-
-        val authHeaders = resolveBackendAuthHeaders()
-        if (!authHeaders.hasAnyToken) {
-            return@withContext VoiceBackendResult.Error(AUTH_TOKEN_MISSING_MESSAGE)
         }
 
         val roundedSpeed = (speed.coerceIn(0.75f, 1.25f) * 100f).roundToInt() / 100f
@@ -430,7 +378,6 @@ class VoiceBackendClient(
                 onFirstAudioChunk(doneWait)
                 return@withContext VoiceBackendResult.Success(TtsAudioSource.CachedFile(sharedFile))
             }
-            // Fall through cleanly to issue a fresh attempt if prior owner was cancelled/failed
         }
 
         val ownerDeferred = CompletableDeferred<File?>()
@@ -463,7 +410,7 @@ class VoiceBackendClient(
 
         try {
             onBackendRequestStart(nanoClock())
-            val execResult = executeTtsWithRetries(endpoint, authHeaders, payload)
+            val execResult = executeTtsWithRetries(endpoint, payload)
             when (execResult) {
                 is TtsHttpOutcome.Failure -> {
                     inFlightRequests.remove(requestKey, ownerDeferred)
@@ -612,14 +559,13 @@ class VoiceBackendClient(
 
     private suspend fun executeTtsWithRetries(
         endpoint: String,
-        authHeaders: BackendAuthHeaders,
         payloadJson: String
     ): TtsHttpOutcome {
         var attempt = 0
         while (true) {
             val request = Request.Builder()
                 .url(endpoint)
-                .withBackendAuth(authHeaders)
+                .withStandaloneClientHeaders()
                 .addHeader("Accept", "audio/mpeg")
                 .post(payloadJson.toRequestBody("application/json; charset=utf-8".toMediaType()))
                 .build()
@@ -690,8 +636,9 @@ class VoiceBackendClient(
     private fun friendlyHttpErrorMessage(code: Int, rawDetail: String): String {
         val extracted = runCatching { JSONObject(rawDetail).optString("error", "") }.getOrDefault("")
         return when (code) {
-            401 -> "Voice backend authorization failed (HTTP 401). Verify Firebase App Check or backend auth configuration."
+            401 -> "Backend authorization failed (HTTP 401). Check your backend access token configuration."
             422 -> extracted.ifBlank { "No ElevenLabs Voice ID is configured yet. Select or configure an Indian voice in Voice Settings." }
+            426 -> HTTPS_REQUIRED_MESSAGE
             429 -> "Voice service is busy right now (rate limit). Please try again in a few seconds."
             503 -> extracted.ifBlank { "ElevenLabs voice service is not configured on the backend server." }
             504 -> "Voice synthesis timed out on the server. Please try again."
@@ -753,23 +700,20 @@ class VoiceBackendClient(
         wavBytes: ByteArray,
         language: SaathiLanguage
     ): VoiceBackendResult<String> = withContext(Dispatchers.IO) {
-        val cleanUrl = baseUrl.trim().trimEnd('/')
-        if (cleanUrl.isBlank()) {
+        val trimmed = baseUrl.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
             return@withContext VoiceBackendResult.NotConfigured(
                 "ElevenLabs Scribe requires your secure backend URL. Configure it in Voice Settings or switch to Device Speech Recognition."
             )
         }
-        val authHeaders = resolveBackendAuthHeaders()
-        if (!authHeaders.hasAnyToken) {
-            return@withContext VoiceBackendResult.Error(AUTH_TOKEN_MISSING_MESSAGE)
-        }
+        val cleanUrl = validateBackendUrl(trimmed)
+            ?: return@withContext VoiceBackendResult.Error(HTTPS_REQUIRED_MESSAGE)
 
-        return@withContext executeSttWithRetries(cleanUrl, authHeaders, wavBytes, language)
+        return@withContext executeSttWithRetries(cleanUrl, wavBytes, language)
     }
 
     private suspend fun executeSttWithRetries(
         cleanUrl: String,
-        authHeaders: BackendAuthHeaders,
         wavBytes: ByteArray,
         language: SaathiLanguage
     ): VoiceBackendResult<String> {
@@ -787,7 +731,7 @@ class VoiceBackendClient(
 
             val request = Request.Builder()
                 .url("$cleanUrl/v1/stt")
-                .withBackendAuth(authHeaders)
+                .withStandaloneClientHeaders()
                 .post(multipart)
                 .build()
 
@@ -822,7 +766,8 @@ class VoiceBackendClient(
                 }
 
                 val friendlyMsg = when (code) {
-                    401 -> "Voice backend authorization failed (HTTP 401). Verify Firebase App Check or backend auth configuration."
+                    401 -> "Backend authorization failed (HTTP 401). Check your backend access token configuration."
+                    426 -> HTTPS_REQUIRED_MESSAGE
                     429 -> "Speech recognition is busy right now (rate limit). Please try again in a few seconds."
                     503 -> "ElevenLabs speech recognition is not configured on the backend server."
                     504 -> "Speech recognition timed out on the server. Please try again."
@@ -900,15 +845,14 @@ class VoiceBackendClient(
 
     private companion object {
         const val TAG = "VoiceBackendClient"
-        const val AUTH_TOKEN_MISSING_MESSAGE =
-            "Firebase App Check verification token is unavailable. Verify Firebase configuration and try again."
+        const val HTTPS_REQUIRED_MESSAGE =
+            "For your security, SAATHI requires an HTTPS backend URL (https://...)."
         const val MAX_TTS_RETRIES = 2
         const val MAX_STT_RETRIES = 1
         const val INITIAL_PROBE_BYTES = 1024
         const val MAX_CACHE_ENTRIES = 8
         const val CACHE_TTL_MS = 180_000L
         const val MAX_CACHED_CLIP_BYTES = 1024 * 1024 // 1 MB
-        const val TOKEN_CACHE_TTL_NS = 240_000_000_000L // 4 minutes
 
         val SHARED_HTTP_CLIENT: OkHttpClient = OkHttpClient.Builder()
             .connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))

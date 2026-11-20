@@ -12,7 +12,6 @@ import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.SaathiDatabase
 import com.example.data.local.UserPreferencesRepository
 import com.example.data.remote.CompanionStreamTransport
-import com.example.data.remote.FirestoreRepository
 import com.example.data.remote.SaathiAiRepository
 import com.example.data.remote.VoiceBackendClient
 import com.example.model.SaathiLanguage
@@ -24,7 +23,6 @@ import com.example.voice.AudioRecorderManager
 import com.example.voice.SpeechEnvironmentChecker
 import com.example.voice.SpeechRecognizerClient
 import com.example.voice.VoiceAudioPlayer
-import com.google.firebase.FirebaseApp
 import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -91,9 +89,6 @@ class SaathiViewModelVoiceFlowTest {
     fun setUp() {
         Dispatchers.setMain(Dispatchers.Unconfined)
         context = ApplicationProvider.getApplicationContext()
-        if (FirebaseApp.getApps(context).isEmpty()) {
-            FirebaseApp.initializeApp(context)
-        }
 
         ShadowMediaPlayer.setMediaInfoProvider { ShadowMediaPlayer.MediaInfo(60_000, 0) }
         val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -228,11 +223,10 @@ class SaathiViewModelVoiceFlowTest {
             isGuestSession = true,
             dao = db.saathiDao(),
             prefsRepo = prefsRepo,
-            firestoreRepo = FirestoreRepository(context),
             aiRepo = aiRepo,
             voiceBackendClient = VoiceBackendClient(
                 context = context,
-                tokenProvider = { "test_token" }
+                clientTokenProvider = { "test_token" }
             ),
             speechRecognizer = speechManager,
             audioRecorder = AudioRecorderManager(null),
@@ -704,11 +698,7 @@ class SaathiViewModelVoiceFlowTest {
             delay(20)
         }
         val reqWithMem = capturedAiRequests.last()
-        val historyDumpWithMem = reqWithMem.history.joinToString("\n") { content ->
-            content.parts.joinToString(" ") { part ->
-                (part as? com.google.firebase.ai.type.TextPart)?.text.orEmpty()
-            }
-        }
+        val historyDumpWithMem = reqWithMem.history.joinToString("\n") { it.text }
         assertTrue("Expected memory in history, got: $historyDumpWithMem", historyDumpWithMem.contains("Hyderabadi biryani"))
 
         // 3. When memoryEnabled = false, Gemini prompt omits memories
@@ -721,11 +711,7 @@ class SaathiViewModelVoiceFlowTest {
             delay(20)
         }
         val reqWithoutMem = capturedAiRequests.last()
-        val historyDumpWithoutMem = reqWithoutMem.history.joinToString("\n") { content ->
-            content.parts.joinToString(" ") { part ->
-                (part as? com.google.firebase.ai.type.TextPart)?.text.orEmpty()
-            }
-        }
+        val historyDumpWithoutMem = reqWithoutMem.history.joinToString("\n") { it.text }
         assertTrue(!historyDumpWithoutMem.contains("Hyderabadi biryani"))
 
         // 4. Delete individual memory & clear all memories
@@ -877,11 +863,10 @@ class SaathiViewModelVoiceFlowTest {
             isGuestSession = true,
             dao = db.saathiDao(),
             prefsRepo = prefsRepo,
-            firestoreRepo = FirestoreRepository(context),
             aiRepo = streamingAiRepo,
             voiceBackendClient = VoiceBackendClient(
                 context = context,
-                tokenProvider = { "test_token" }
+                clientTokenProvider = { "test_token" }
             ),
             speechRecognizer = speechManager,
             audioRecorder = AudioRecorderManager(null),
@@ -977,9 +962,7 @@ class SaathiViewModelVoiceFlowTest {
         // while keeping total history bounded (<= 16 messages)
         val lastAiReq = capturedAiRequests.last()
         assertTrue("History size should be bounded (got ${lastAiReq.history.size})", lastAiReq.history.size <= 16)
-        val firstHistoryText = lastAiReq.history.first().parts.joinToString(" ") { part ->
-            (part as? com.google.firebase.ai.type.TextPart)?.text.orEmpty()
-        }
+        val firstHistoryText = lastAiReq.history.first().text
         assertTrue("Initial greeting must be preserved in long history, got: $firstHistoryText", firstHistoryText.isNotBlank())
 
         // Verify latency telemetry recorded all 10 text turns and 10 voice turns with 0 failures

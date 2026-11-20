@@ -9,7 +9,6 @@ import com.example.data.local.MessageEntity
 import com.example.data.local.SaathiDao
 import com.example.data.local.UserPreferencesRepository
 import com.example.data.local.UserPreferencesState
-import com.example.data.remote.FirestoreRepository
 import com.example.data.remote.SaathiAiRepository
 import com.example.data.remote.TtsAudioSource
 import com.example.data.remote.VoiceBackendClient
@@ -27,27 +26,22 @@ import com.example.model.VoiceSessionState
 import com.example.voice.AndroidSpeechRecognizerManager
 import com.example.voice.AudioRecorderManager
 import com.example.voice.VoiceAudioPlayer
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
-import com.google.firebase.firestore.FirebaseFirestoreException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.Deferred
-import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.tasks.await
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
@@ -96,10 +90,9 @@ class SaathiViewModel(
     val userDisplayName: String,
     val userEmail: String,
     val userPhotoUrl: String?,
-    val isGuestSession: Boolean = false,
+    val isGuestSession: Boolean = true,
     private val dao: SaathiDao,
     private val prefsRepo: UserPreferencesRepository,
-    private val firestoreRepo: FirestoreRepository,
     private val aiRepo: SaathiAiRepository,
     private val voiceBackendClient: VoiceBackendClient,
     private val speechRecognizer: AndroidSpeechRecognizerManager,
@@ -117,9 +110,6 @@ class SaathiViewModel(
         )
     )
     val uiState: StateFlow<CompanionUiState> = _uiState.asStateFlow()
-
-    private val canUseCloudSync: Boolean
-        get() = !isGuestSession && preferences.value.cloudSyncEnabled
 
     val preferences: StateFlow<UserPreferencesState> = prefsRepo.preferencesFlow
         .stateIn(
@@ -195,7 +185,6 @@ class SaathiViewModel(
     private var lastSubmittedTextAtMs: Long = 0L
 
     init {
-        syncProfileAndCloudObservers()
         observeBackendVoices()
     }
 
@@ -220,100 +209,6 @@ class SaathiViewModel(
         }
     }
 
-    private fun syncProfileAndCloudObservers() {
-        // Temporary debug guest sessions are strictly local and never read/write Firestore
-        if (isGuestSession) return
-        viewModelScope.launch {
-            val currentPrefs = preferences.value
-            firestoreRepo.ensureProfileExists(
-                displayName = userDisplayName,
-                photoUrl = userPhotoUrl,
-                language = currentPrefs.preferredLanguage,
-                voiceId = currentPrefs.selectedVoiceId,
-                voiceGender = currentPrefs.selectedVoiceGender
-            )
-        }
-
-        // Sync remote memories into local Room cache when cloud sync is enabled
-        viewModelScope.launch {
-            firestoreRepo.observeMemories(currentUserId)
-                .catch { error ->
-                    val fsErr = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (fsErr == null && error is CancellationException) throw error
-                    Log.w(TAG, "Cloud memory observer warning: ${(fsErr ?: error).message}")
-                }
-                .collect { remoteList ->
-                    if (preferences.value.cloudSyncEnabled) {
-                        val existingById = dao.getMemoriesOnce(currentUserId).associateBy { it.id }
-                        val isTeluguPref = preferences.value.preferredLanguage == SaathiLanguage.TELUGU
-                        for (doc in remoteList) {
-                            val remoteUpdatedAt = doc.updatedAt?.toDate()?.time ?: System.currentTimeMillis()
-                            val local = existingById[doc.id]
-                            if (local == null || remoteUpdatedAt > local.updatedAtEpochMs) {
-                                val safeContent = if (isTeluguPref) {
-                                    SaathiVoiceCatalog.ensureRomanTeluguDisplay(doc.content)
-                                } else {
-                                    doc.content
-                                }
-                                dao.upsertMemory(
-                                    MemoryEntity(
-                                        id = doc.id,
-                                        userId = currentUserId,
-                                        category = doc.category,
-                                        content = safeContent,
-                                        createdAtEpochMs = doc.createdAt?.toDate()?.time ?: remoteUpdatedAt,
-                                        updatedAtEpochMs = remoteUpdatedAt
-                                    )
-                                )
-                            }
-                        }
-                    }
-                }
-        }
-
-        // Sync remote conversation headers into local Room cache without overwriting newer local updates
-        viewModelScope.launch {
-            firestoreRepo.observeConversations(currentUserId)
-                .catch { error ->
-                    val fsErr = generateSequence(error) { it.cause }
-                        .filterIsInstance<FirebaseFirestoreException>()
-                        .firstOrNull()
-                    if (fsErr == null && error is CancellationException) throw error
-                    Log.w(TAG, "Cloud conversation observer warning: ${(fsErr ?: error).message}")
-                }
-                .collect { remoteConvs ->
-                    if (preferences.value.cloudSyncEnabled) {
-                        for (doc in remoteConvs) {
-                            val remoteUpdatedAt = doc.updatedAt?.toDate()?.time ?: System.currentTimeMillis()
-                            val local = dao.getConversationById(doc.id)
-                            if (local == null || remoteUpdatedAt > local.updatedAtEpochMs) {
-                                val isTeluguConv = doc.languageCode.equals(SaathiLanguage.TELUGU.name, ignoreCase = true)
-                                val safeTitle = if (isTeluguConv) {
-                                    SaathiVoiceCatalog.ensureRomanTeluguDisplay(doc.title)
-                                } else doc.title
-                                val safePreview = if (isTeluguConv) {
-                                    SaathiVoiceCatalog.ensureRomanTeluguDisplay(doc.lastMessagePreview)
-                                } else doc.lastMessagePreview
-                                dao.upsertConversation(
-                                    ConversationEntity(
-                                        id = doc.id,
-                                        userId = currentUserId,
-                                        title = safeTitle,
-                                        languageCode = doc.languageCode,
-                                        lastMessagePreview = safePreview,
-                                        createdAtEpochMs = doc.createdAt?.toDate()?.time ?: remoteUpdatedAt,
-                                        updatedAtEpochMs = remoteUpdatedAt
-                                    )
-                                )
-                            }
-                        }
-                    }
-                }
-        }
-    }
-
     fun onAppBackgrounded() {
         isAppInForeground = false
         voiceTurnSequence++
@@ -329,6 +224,7 @@ class SaathiViewModel(
         activePreviewJob = null
         speakingPulseJob?.cancel()
         speakingPulseJob = null
+        aiRepo.cancelActiveRequests()
         voiceBackendClient.cancelActiveSttRequest()
         voiceBackendClient.cancelActiveTtsRequest()
         audioPlayer.stop()
@@ -461,18 +357,6 @@ class SaathiViewModel(
             dao.upsertMessage(greetingMsg)
             updateConversationHeader(actualConvId, greetingText, prefs.preferredLanguage, now)
 
-            if (canUseCloudSync) {
-                launch {
-                    firestoreRepo.upsertConversation(
-                        conversationId = actualConvId,
-                        title = dao.getConversationById(actualConvId)?.title ?: greetingText.take(40),
-                        language = prefs.preferredLanguage,
-                        lastMessagePreview = greetingText.take(120)
-                    )
-                    firestoreRepo.addMessage(actualConvId, msgId, "model", greetingText, true)
-                }
-            }
-
             _uiState.update { state ->
                 if (state.activeConversationId == actualConvId) {
                     state.copy(
@@ -578,6 +462,7 @@ class SaathiViewModel(
         activePreviewJob = null
         speakingPulseJob?.cancel()
         speakingPulseJob = null
+        aiRepo.cancelActiveRequests()
         voiceBackendClient.cancelActiveSttRequest()
         voiceBackendClient.cancelActiveTtsRequest()
         audioPlayer.stop()
@@ -996,19 +881,6 @@ class SaathiViewModel(
                 )
                 dao.upsertMessage(userMsg)
                 updateConversationHeader(convId, cleanText, prefs.preferredLanguage, now)
-
-                if (canUseCloudSync) {
-                    launch {
-                        val title = knownConversationTitles[convId] ?: cleanText.take(40)
-                        firestoreRepo.upsertConversation(
-                            conversationId = convId,
-                            title = title,
-                            language = prefs.preferredLanguage,
-                            lastMessagePreview = cleanText.take(120)
-                        )
-                        firestoreRepo.addMessage(convId, userMsgId, "user", cleanText, isVoiceMode)
-                    }
-                }
             }
 
             val historyPreparedAtNs = latencyRecorder.nowNs()
@@ -1040,6 +912,7 @@ class SaathiViewModel(
                     memories = activeMemories,
                     memoryEnabled = prefs.memoryEnabled,
                     isVoiceMode = isVoiceMode,
+                    backendUrl = prefs.voiceBackendUrl,
                     onRequestStarted = { ts -> geminiStartAtNs = ts },
                     onFirstToken = { ts -> geminiFirstTokenAtNs = ts },
                     onCompleted = { ts -> geminiCompleteAtNs = ts }
@@ -1104,23 +977,14 @@ class SaathiViewModel(
                 dao.upsertMessage(modelMsg)
                 updateConversationHeader(convId, finalReply, prefs.preferredLanguage, replyTime)
 
-                if (canUseCloudSync) {
-                    launch {
-                        val title = knownConversationTitles[convId] ?: cleanText.take(40)
-                        firestoreRepo.upsertConversation(
-                            conversationId = convId,
-                            title = title,
-                            language = prefs.preferredLanguage,
-                            lastMessagePreview = finalReply.take(120)
-                        )
-                        firestoreRepo.addMessage(convId, modelMsgId, "model", finalReply, isVoiceMode)
-                    }
-                }
-
                 // Run background memory extraction after primary reply completes so it never contends with reply streaming
                 if (prefs.memoryEnabled && isStillActiveConv) {
                     launch {
-                        val candidate = aiRepo.extractMemoryCandidate(cleanText, activeMemories)
+                        val candidate = aiRepo.extractMemoryCandidate(
+                            userMessage = cleanText,
+                            existingMemories = activeMemories,
+                            backendUrl = prefs.voiceBackendUrl
+                        )
                         if (candidate != null && _uiState.value.activeConversationId == convId) {
                             val normalizedCandidate = if (prefs.preferredLanguage == SaathiLanguage.TELUGU) {
                                 candidate.copy(content = SaathiVoiceCatalog.ensureRomanTeluguDisplay(candidate.content))
@@ -1889,35 +1753,6 @@ class SaathiViewModel(
                         dao.upsertMessage(msg.copy(text = SaathiVoiceCatalog.ensureRomanTeluguDisplay(msg.text)))
                     }
                 }
-            }
-            if (canUseCloudSync) {
-                val localIds = localMsgs.map { it.id }.toHashSet()
-                val remoteMsgs = firestoreRepo.getMessagesOnce(conversationId).getOrNull().orEmpty()
-                var insertedAny = false
-                for (doc in remoteMsgs) {
-                    // Never overwrite existing local messages; only backfill missing remote messages
-                    if (doc.id !in localIds) {
-                        val safeText = if (isTeluguConv) {
-                            SaathiVoiceCatalog.ensureRomanTeluguDisplay(doc.text)
-                        } else doc.text
-                        dao.upsertMessage(
-                            MessageEntity(
-                                id = doc.id,
-                                conversationId = conversationId,
-                                userId = currentUserId,
-                                role = doc.role,
-                                text = safeText,
-                                isVoice = doc.isVoice,
-                                timestampEpochMs = doc.createdAt?.toDate()?.time ?: System.currentTimeMillis()
-                            )
-                        )
-                        insertedAny = true
-                    }
-                }
-                if (insertedAny || isTeluguConv) {
-                    localMsgs = dao.getMessagesOnce(conversationId)
-                }
-            } else if (isTeluguConv) {
                 localMsgs = dao.getMessagesOnce(conversationId)
             }
             val latestReply = localMsgs.lastOrNull { it.role == "model" }?.text.orEmpty()
@@ -1936,18 +1771,6 @@ class SaathiViewModel(
         viewModelScope.launch {
             val now = System.currentTimeMillis()
             dao.renameConversation(conversationId, clean, now)
-            if (canUseCloudSync) {
-                val conv = dao.getConversationById(conversationId)
-                val lang = runCatching {
-                    SaathiLanguage.valueOf(conv?.languageCode ?: SaathiLanguage.ENGLISH.name)
-                }.getOrDefault(SaathiLanguage.ENGLISH)
-                firestoreRepo.upsertConversation(
-                    conversationId = conversationId,
-                    title = clean,
-                    language = lang,
-                    lastMessagePreview = conv?.lastMessagePreview ?: ""
-                )
-            }
         }
     }
 
@@ -1956,9 +1779,6 @@ class SaathiViewModel(
         viewModelScope.launch {
             dao.deleteConversation(conversationId)
             greetedConversationIds.remove(conversationId)
-            if (canUseCloudSync) {
-                firestoreRepo.deleteConversation(conversationId)
-            }
             if (_uiState.value.activeConversationId == conversationId) {
                 startNewConversation()
             }
@@ -2005,9 +1825,6 @@ class SaathiViewModel(
         viewModelScope.launch {
             try {
                 prefsRepo.setLanguage(language)
-                if (canUseCloudSync) {
-                    firestoreRepo.updateProfileFields(mapOf("preferredLanguage" to language.name))
-                }
             } finally {
                 if (pendingLanguageOverride == language) {
                     pendingLanguageOverride = null
@@ -2063,20 +1880,12 @@ class SaathiViewModel(
 
         viewModelScope.launch {
             prefsRepo.setVoice(resolvedId, gender)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(
-                    mapOf("selectedVoiceId" to resolvedId, "selectedVoiceGender" to gender.name)
-                )
-            }
         }
     }
 
     fun setSpeechSpeed(speed: Float) {
         viewModelScope.launch {
             prefsRepo.setSpeechSpeed(speed)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("speechSpeed" to speed.toDouble()))
-            }
         }
     }
 
@@ -2084,18 +1893,12 @@ class SaathiViewModel(
         audioPlayer.updateVolume(volume)
         viewModelScope.launch {
             prefsRepo.setSpeechVolume(volume)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("speechVolume" to volume.toDouble()))
-            }
         }
     }
 
     fun setAutoPlayVoice(enabled: Boolean) {
         viewModelScope.launch {
             prefsRepo.setAutoPlayVoice(enabled)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("autoPlayVoice" to enabled))
-            }
         }
     }
 
@@ -2121,26 +1924,16 @@ class SaathiViewModel(
     fun setMemoryEnabled(enabled: Boolean) {
         viewModelScope.launch {
             prefsRepo.setMemoryEnabled(enabled)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("memoryEnabled" to enabled))
-            }
         }
     }
 
-    fun setCloudSyncEnabled(enabled: Boolean) {
-        if (isGuestSession) return
-        viewModelScope.launch {
-            prefsRepo.setCloudSyncEnabled(enabled)
-            firestoreRepo.updateProfileFields(mapOf("cloudSyncEnabled" to enabled))
-        }
+    fun setCloudSyncEnabled(@Suppress("UNUSED_PARAMETER") enabled: Boolean) {
+        // Standalone local-only storage mode: conversations and memories remain strictly on-device.
     }
 
     fun setDailyRemindersEnabled(enabled: Boolean) {
         viewModelScope.launch {
             prefsRepo.setDailyRemindersEnabled(enabled)
-            if (canUseCloudSync) {
-                firestoreRepo.updateProfileFields(mapOf("dailyRemindersEnabled" to enabled))
-            }
         }
     }
 
@@ -2148,9 +1941,6 @@ class SaathiViewModel(
         val clean = name.trim().take(60)
         viewModelScope.launch {
             prefsRepo.setPreferredName(clean)
-            if (canUseCloudSync && clean.isNotEmpty()) {
-                firestoreRepo.updateProfileFields(mapOf("preferredName" to clean))
-            }
         }
     }
 
@@ -2183,28 +1973,18 @@ class SaathiViewModel(
                     updatedAtEpochMs = now
                 )
             )
-            if (canUseCloudSync) {
-                firestoreRepo.saveMemory(memId, category, cleanContent, isNew = existingId == null)
-            }
         }
     }
 
     fun deleteMemory(memoryId: String) {
         viewModelScope.launch {
             dao.deleteMemory(memoryId)
-            if (canUseCloudSync) {
-                firestoreRepo.deleteMemory(memoryId)
-            }
         }
     }
 
     fun clearAllMemories() {
         viewModelScope.launch {
-            val all = dao.getMemoriesOnce(currentUserId)
             dao.clearMemoriesForUser(currentUserId)
-            if (canUseCloudSync) {
-                all.forEach { firestoreRepo.deleteMemory(it.id) }
-            }
         }
     }
 
@@ -2213,21 +1993,6 @@ class SaathiViewModel(
         viewModelScope.launch {
             dao.clearConversationsForUser(currentUserId)
             greetedConversationIds.clear()
-            if (canUseCloudSync) {
-                val remote = firestoreRepo.observeConversations(currentUserId)
-                    .catch { }
-                    .let { flow ->
-                        var items: List<com.example.model.ConversationDoc> = emptyList()
-                        runCatching {
-                            flow.collect {
-                                items = it
-                                throw kotlinx.coroutines.CancellationException("Done")
-                            }
-                        }
-                        items
-                    }
-                remote.forEach { firestoreRepo.deleteConversation(it.id) }
-            }
             startNewConversation()
         }
     }
@@ -2236,20 +2001,11 @@ class SaathiViewModel(
         _uiState.update { it.copy(isDeletingAccount = true) }
         viewModelScope.launch {
             try {
-                if (!isGuestSession) {
-                    firestoreRepo.deleteAllUserData()
-                }
                 dao.clearConversationsForUser(currentUserId)
                 dao.clearMemoriesForUser(currentUserId)
                 greetedConversationIds.clear()
                 knownConversationTitles.clear()
-                if (!isGuestSession) {
-                    prefsRepo.clearAll()
-                    runCatching { Firebase.auth.currentUser?.delete()?.await() }
-                    Firebase.auth.signOut()
-                } else {
-                    startNewConversation()
-                }
+                startNewConversation()
                 _uiState.update { it.copy(isDeletingAccount = false) }
                 onComplete()
             } catch (e: Exception) {

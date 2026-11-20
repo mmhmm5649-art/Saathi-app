@@ -1,6 +1,5 @@
 package com.example
 
-import android.content.Intent
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -29,10 +28,8 @@ import androidx.navigation.compose.rememberNavController
 import com.example.data.local.SaathiDatabase
 import com.example.data.local.UserPreferencesRepository
 import com.example.data.local.UserPreferencesState
-import com.example.data.remote.FirestoreRepository
 import com.example.data.remote.SaathiAiRepository
 import com.example.data.remote.VoiceBackendClient
-import com.example.security.configureAppCheck
 import com.example.ui.screens.HistoryScreen
 import com.example.ui.screens.LanguageSelectionScreen
 import com.example.ui.screens.MemoryScreen
@@ -48,8 +45,6 @@ import com.example.viewmodel.SaathiViewModel
 import com.example.voice.AndroidSpeechRecognizerManager
 import com.example.voice.AudioRecorderManager
 import com.example.voice.VoiceAudioPlayer
-import com.google.firebase.Firebase
-import com.google.firebase.auth.auth
 import kotlinx.coroutines.launch
 
 object SaathiRoutes {
@@ -71,9 +66,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // STEP 1: Configure App Check with launch intent before UI or Firebase operations
-        configureAppCheck(this, intent)
-
         enableEdgeToEdge()
 
         setContent {
@@ -81,12 +73,6 @@ class MainActivity : ComponentActivity() {
                 SaathiRootApp()
             }
         }
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        configureAppCheck(this, intent)
     }
 }
 
@@ -98,7 +84,6 @@ private fun SaathiRootApp() {
     val preferences by prefsRepo.preferencesFlow.collectAsStateWithLifecycle(initialValue = UserPreferencesState())
 
     var showSplash by remember { mutableStateOf(true) }
-    val currentUser = remember { runCatching { Firebase.auth.currentUser }.getOrNull() }
 
     when {
         showSplash -> {
@@ -118,19 +103,13 @@ private fun SaathiRootApp() {
         }
 
         else -> {
-            val activeUserId = currentUser?.uid ?: LOCAL_USER_ID
-            val activeDisplayName = currentUser?.displayName?.takeIf { it.isNotBlank() } ?: LOCAL_DISPLAY_NAME
-            val activeEmail = currentUser?.email?.takeIf { it.isNotBlank() } ?: LOCAL_PROFILE_SUBTITLE
-            val activePhotoUrl = currentUser?.photoUrl?.toString()
-            val isLocalSession = currentUser == null
-
-            key(activeUserId) {
+            key(LOCAL_USER_ID) {
                 SaathiAppContent(
-                    currentUserId = activeUserId,
-                    displayName = activeDisplayName,
-                    email = activeEmail,
-                    photoUrl = activePhotoUrl,
-                    isLocalSession = isLocalSession
+                    currentUserId = LOCAL_USER_ID,
+                    displayName = LOCAL_DISPLAY_NAME,
+                    email = LOCAL_PROFILE_SUBTITLE,
+                    photoUrl = null,
+                    isLocalSession = true
                 )
             }
         }
@@ -162,7 +141,6 @@ private fun SaathiAppContent(
                     isGuestSession = isLocalSession,
                     dao = db.saathiDao(),
                     prefsRepo = UserPreferencesRepository(app),
-                    firestoreRepo = FirestoreRepository(app),
                     aiRepo = SaathiAiRepository(),
                     voiceBackendClient = VoiceBackendClient(app),
                     speechRecognizer = AndroidSpeechRecognizerManager(app),
@@ -349,7 +327,7 @@ private fun SaathiAppContent(
                         onComplete = {
                             Toast.makeText(
                                 context,
-                                if (isLocalSession) "Local data cleared" else "Account and data deleted",
+                                "Local data cleared",
                                 Toast.LENGTH_SHORT
                             ).show()
                         },

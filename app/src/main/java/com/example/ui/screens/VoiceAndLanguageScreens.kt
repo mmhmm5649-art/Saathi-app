@@ -539,7 +539,7 @@ fun VoiceSelectionScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // Secure ElevenLabs Backend Setup Card
+            // Secure SAATHI AI & Voice Backend Setup Card
             SaathiGlassCard(modifier = Modifier.fillMaxWidth()) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -549,10 +549,10 @@ fun VoiceSelectionScreen(
                             tint = if (preferences.voiceBackendUrl.isNotBlank()) OnlineGreen else SoftBlue
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("ElevenLabs Secure Backend", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+                        Text("SAATHI Secure AI & Voice Backend", style = MaterialTheme.typography.titleMedium, color = TextPrimary)
                     }
                     Text(
-                        text = "Your ElevenLabs API key stays strictly on the backend (backend/server.js). Voice IDs can be configured via backend environment variables or synced above.",
+                        text = "Your Gemini API key, ElevenLabs API key, and Voice IDs stay strictly on the backend (backend/server.js) over HTTPS. Nothing sensitive is embedded in this APK.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextSecondary
                     )
@@ -562,8 +562,8 @@ fun VoiceSelectionScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("voice_backend_url_input"),
-                        label = { Text("Voice Backend HTTPS URL") },
-                        placeholder = { Text("https://saathi-voice-xxxx.run.app") },
+                        label = { Text("SAATHI Backend HTTPS URL") },
+                        placeholder = { Text("https://saathi-backend-xxxx.run.app") },
                         singleLine = true,
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = ElectricViolet,

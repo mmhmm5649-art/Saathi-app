@@ -345,25 +345,135 @@ test("extracts ElevenLabs Voice IDs cleanly whether provided as raw IDs or URLs"
   if (fs.existsSync(cfgPath)) fs.unlinkSync(cfgPath);
 });
 
-test("backend auth middleware accepts valid Firebase App Check or Bearer tokens and rejects unauthorized requests", async () => {
-  const { createFirebaseAuthMiddleware } = require("./authMiddleware");
-  const middleware = createFirebaseAuthMiddleware({
-    verifyIdToken: async (token) => {
-      if (token === "valid_id_token") return { uid: "user_123" };
-      throw new Error("bad id token");
+test("geminiService streams SSE conversation replies with system instructions, history context, and model fallback", async () => {
+  const { createGeminiService } = require("./geminiService");
+  const recordedCalls = [];
+
+  const service = createGeminiService({
+    env: {
+      GEMINI_API_KEY: "test_server_gemini_key",
+      GEMINI_PRIMARY_MODEL: "gemini-2.5-flash",
+      GEMINI_FALLBACK_MODEL: "gemini-2.5-flash-lite",
     },
-    verifyAppCheckToken: async (token) => {
-      if (token === "valid_app_check_token") return { appId: "1:123:android:abc" };
-      throw new Error("bad app check token");
+    fetchImpl: async (url, init) => {
+      const body = JSON.parse(init.body);
+      recordedCalls.push({ url, headers: init.headers, body });
+      if (url.includes("gemini-2.5-flash:")) {
+        // Simulate transient upstream outage on primary model to verify fallback
+        return new Response("Overloaded", { status: 503 });
+      }
+      const ssePayload = [
+        'data: {"candidates":[{"content":{"parts":[{"text":"Nenu baane unna ra! "}]}}]}\n\n',
+        'data: {"candidates":[{"content":{"parts":[{"text":"Nuvvu cheppu, em chestunnav?"}]}}]}\n\n',
+      ].join("");
+      return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(ssePayload));
+          controller.close();
+        },
+      }), { status: 200, headers: { "content-type": "text/event-stream" } });
     },
   });
 
-  const invoke = async (headers) => {
-    const req = { headers };
+  const chunks = [];
+  const res = await service.streamConversation({
+    systemInstruction: "You are SAATHI, a warm Roman Telugu friend.",
+    history: [
+      { role: "user", text: "Hey Saathi" },
+      { role: "model", text: "Arey, ela unnav ra? Baagunnava?" },
+    ],
+    userMessage: "Ela unnav ra?",
+    maxOutputTokens: 256,
+    onChunk: (piece) => chunks.push(piece),
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.modelUsed, "gemini-2.5-flash-lite");
+  assert.equal(chunks.join(""), "Nenu baane unna ra! Nuvvu cheppu, em chestunnav?");
+  assert.ok(recordedCalls.length >= 2);
+  assert.equal(recordedCalls[0].headers["x-goog-api-key"], "test_server_gemini_key");
+  assert.ok(!recordedCalls[0].url.includes("test_server_gemini_key"), "API key must never appear in URL");
+  assert.equal(recordedCalls[0].body.systemInstruction.parts[0].text, "You are SAATHI, a warm Roman Telugu friend.");
+  assert.equal(recordedCalls[0].body.contents.length, 3);
+  assert.equal(recordedCalls[0].body.contents[2].parts[0].text, "Ela unnav ra?");
+});
+
+test("geminiService handles client cancellation and structured JSON memory extraction", async () => {
+  const { createGeminiService } = require("./geminiService");
+
+  // 1. Cancellation aborts upstream Gemini fetch cleanly
+  const abortService = createGeminiService({
+    env: { GEMINI_API_KEY: "test_server_gemini_key" },
+    fetchImpl: async (_url, init) => {
+      return await new Promise((_resolve, reject) => {
+        init.signal?.addEventListener("abort", () => {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    },
+  });
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 15);
+  const cancelled = await abortService.streamConversation({
+    userMessage: "Stop test",
+    signal: ac.signal,
+  });
+  assert.equal(cancelled.ok, false);
+  assert.equal(cancelled.status, 499);
+
+  // 2. Memory extraction parses structured JSON response
+  const memService = createGeminiService({
+    env: { GEMINI_API_KEY: "test_server_gemini_key" },
+    fetchImpl: async () => new Response(
+      JSON.stringify({
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    shouldSuggest: true,
+                    category: "Interest",
+                    content: "Loves late-night Telugu movie discussions",
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    ),
+  });
+  const memRes = await memService.extractMemoryCandidate({
+    prompt: "User said: I love watching Telugu movies late at night.",
+  });
+  assert.equal(memRes.ok, true);
+  assert.equal(memRes.suggestion.shouldSuggest, true);
+  assert.equal(memRes.suggestion.category, "Interest");
+  assert.ok(memRes.suggestion.content.includes("Telugu movies") || memRes.suggestion.content.includes("Telugu movie"));
+});
+
+test("standalone securityMiddleware enforces rate limiting, optional access token, HTTPS, and payload validation", async () => {
+  const {
+    createRateLimiter,
+    createSecurityMiddleware,
+    validateChatPayload,
+    validateMemoryPayload,
+  } = require("./securityMiddleware");
+
+  const invoke = async (middleware, reqInit = {}) => {
+    const req = { headers: {}, ip: "203.0.113.10", secure: true, ...reqInit };
     let statusCode = 200;
     let jsonBody = null;
     let nextCalled = false;
+    const responseHeaders = {};
     const res = {
+      setHeader(k, v) {
+        responseHeaders[k] = v;
+      },
       status(code) {
         statusCode = code;
         return this;
@@ -376,30 +486,48 @@ test("backend auth middleware accepts valid Firebase App Check or Bearer tokens 
     await middleware(req, res, () => {
       nextCalled = true;
     });
-    return { statusCode, jsonBody, nextCalled, req };
+    return { statusCode, jsonBody, nextCalled, responseHeaders };
   };
 
-  // 1. Valid App Check token works without Google Sign-In / Bearer ID token
-  const appCheckOk = await invoke({ "x-firebase-appcheck": "valid_app_check_token" });
-  assert.equal(appCheckOk.nextCalled, true);
-  assert.equal(appCheckOk.req.authMethod, "firebase_app_check");
-  assert.equal(appCheckOk.req.appCheck.appId, "1:123:android:abc");
+  // 1. Optional shared access token enforcement + hardened headers
+  const secured = createSecurityMiddleware({
+    getAccessToken: () => "saathi_secret_token_xyz",
+    requireHttps: () => true,
+  });
 
-  // 2. Valid Firebase ID token still works
-  const bearerOk = await invoke({ authorization: "Bearer valid_id_token" });
-  assert.equal(bearerOk.nextCalled, true);
-  assert.equal(bearerOk.req.authMethod, "firebase_id_token");
-  assert.equal(bearerOk.req.user.uid, "user_123");
+  const missingToken = await invoke(secured, { headers: { host: "api.example.com", "x-forwarded-proto": "https" } });
+  assert.equal(missingToken.nextCalled, false);
+  assert.equal(missingToken.statusCode, 401);
+  assert.equal(missingToken.responseHeaders["X-Content-Type-Options"], "nosniff");
 
-  // 3. Missing credentials rejected with 401
-  const missing = await invoke({});
-  assert.equal(missing.nextCalled, false);
-  assert.equal(missing.statusCode, 401);
+  const cleartextRemote = await invoke(secured, {
+    secure: false,
+    headers: { host: "api.example.com", "x-forwarded-proto": "http", "x-saathi-client-token": "saathi_secret_token_xyz" },
+  });
+  assert.equal(cleartextRemote.nextCalled, false);
+  assert.equal(cleartextRemote.statusCode, 426);
 
-  // 4. Invalid App Check token rejected with 401
-  const invalidAppCheck = await invoke({ "x-firebase-appcheck": "tampered" });
-  assert.equal(invalidAppCheck.nextCalled, false);
-  assert.equal(invalidAppCheck.statusCode, 401);
+  const validToken = await invoke(secured, {
+    secure: false,
+    headers: { host: "api.example.com", "x-forwarded-proto": "https", "x-saathi-client-token": "saathi_secret_token_xyz" },
+  });
+  assert.equal(validToken.nextCalled, true);
+
+  // 2. Per-IP sliding-window rate limiter blocks excessive requests with 429 + Retry-After
+  const limiter = createRateLimiter({ windowMs: 60_000, maxRequests: 2 });
+  assert.equal((await invoke(limiter)).nextCalled, true);
+  assert.equal((await invoke(limiter)).nextCalled, true);
+  const blocked = await invoke(limiter);
+  assert.equal(blocked.nextCalled, false);
+  assert.equal(blocked.statusCode, 429);
+  assert.ok(Number(blocked.responseHeaders["Retry-After"]) >= 1);
+
+  // 3. Payload validation rejects empty/oversized inputs
+  assert.equal(validateChatPayload({ userMessage: "" }).ok, false);
+  assert.equal(validateChatPayload({ userMessage: "a".repeat(4001) }).ok, false);
+  assert.equal(validateChatPayload({ userMessage: "Ela unnav ra?", history: [] }).ok, true);
+  assert.equal(validateMemoryPayload({ prompt: "short" }).ok, false);
+  assert.equal(validateMemoryPayload({ prompt: "User shared a long-term hobby preference." }).ok, true);
 });
 
 if (process.env.ELEVENLABS_API_KEY) {

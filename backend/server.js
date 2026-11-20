@@ -2,9 +2,14 @@ const fs = require("node:fs");
 const path = require("node:path");
 const express = require("express");
 const multer = require("multer");
-const admin = require("firebase-admin");
-const { createFirebaseAuthMiddleware } = require("./authMiddleware");
+const { createGeminiService } = require("./geminiService");
 const { createVoiceService } = require("./voiceService");
+const {
+  createRateLimiter,
+  createSecurityMiddleware,
+  validateChatPayload,
+  validateMemoryPayload,
+} = require("./securityMiddleware");
 
 function loadBackendEnvFile() {
   for (const candidate of [path.join(__dirname, ".env"), path.join(__dirname, "..", ".env")]) {
@@ -30,25 +35,25 @@ function loadBackendEnvFile() {
 
 loadBackendEnvFile();
 
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
-
 const app = express();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 },
 });
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "256kb" }));
 
+const geminiService = createGeminiService();
 const voiceService = createVoiceService();
 const PORT = process.env.PORT || 8080;
 
-const requireFirebaseAuth = createFirebaseAuthMiddleware({
-  verifyIdToken: (token) => admin.auth().verifyIdToken(token),
-  verifyAppCheckToken: (token) => admin.appCheck().verifyToken(token),
-});
+const verifyRequestSecurity = createSecurityMiddleware();
+const chatRateLimit = createRateLimiter({ windowMs: 60_000, maxRequests: 45 });
+const voiceRateLimit = createRateLimiter({ windowMs: 60_000, maxRequests: 60 });
+const configRateLimit = createRateLimiter({ windowMs: 60_000, maxRequests: 30 });
 
 app.get("/health", async (_req, res) => {
   const [config, models] = await Promise.all([
@@ -59,7 +64,10 @@ app.get("/health", async (_req, res) => {
   const maleConfigured = Boolean(config.voices.find((v) => v.slot === "male")?.voiceId);
   res.json({
     ok: true,
-    service: "saathi-voice-backend",
+    service: "saathi-companion-backend",
+    geminiConfigured: Boolean(geminiService.getApiKey()),
+    geminiPrimaryModel: geminiService.getPrimaryModel(),
+    geminiFallbackModel: geminiService.getFallbackModel(),
     elevenLabsConfigured: Boolean(voiceService.getApiKey()),
     ttsModel: config.ttsModel,
     sttModel: config.sttModel,
@@ -69,14 +77,122 @@ app.get("/health", async (_req, res) => {
   });
 });
 
+// Stream human-to-human Gemini companion replies via Server-Sent Events (SSE)
+app.post("/v1/chat/stream", verifyRequestSecurity, chatRateLimit, async (req, res) => {
+  const validation = validateChatPayload(req.body);
+  if (!validation.ok) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const abortController = new AbortController();
+  const onClose = () => abortController.abort();
+  req.on("close", onClose);
+
+  let sseStarted = false;
+  const ensureSseHeaders = () => {
+    if (sseStarted || res.headersSent) return;
+    sseStarted = true;
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.flushHeaders?.();
+  };
+
+  try {
+    const {
+      systemInstruction = "",
+      history = [],
+      userMessage = "",
+      maxOutputTokens = 384,
+      modelName = "",
+      thinkingLevel = "LOW",
+    } = req.body || {};
+
+    const result = await geminiService.streamConversation({
+      systemInstruction,
+      history,
+      userMessage,
+      maxOutputTokens,
+      modelName,
+      thinkingLevel,
+      signal: abortController.signal,
+      onChunk: (piece) => {
+        if (abortController.signal.aborted || res.writableEnded) return;
+        ensureSseHeaders();
+        res.write(`data: ${JSON.stringify({ text: piece })}\n\n`);
+      },
+    });
+
+    if (abortController.signal.aborted || res.writableEnded) {
+      return;
+    }
+
+    if (!result.ok) {
+      if (!sseStarted && !res.headersSent) {
+        return res.status(result.status).json({ error: result.error });
+      }
+      res.write(`data: ${JSON.stringify({ error: result.error })}\n\n`);
+      return res.end();
+    }
+
+    ensureSseHeaders();
+    res.write(`data: ${JSON.stringify({ done: true, modelUsed: result.modelUsed })}\n\n`);
+    res.end();
+  } catch (err) {
+    if (!abortController.signal.aborted) {
+      console.error("Gemini chat proxy error:", err.message || err);
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal Gemini proxy error." });
+    } else if (!res.writableEnded) {
+      res.end();
+    }
+  } finally {
+    req.off("close", onClose);
+  }
+});
+
+// Structured JSON memory candidate extraction via Gemini
+app.post("/v1/memory/extract", verifyRequestSecurity, chatRateLimit, async (req, res) => {
+  const validation = validateMemoryPayload(req.body);
+  if (!validation.ok) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const abortController = new AbortController();
+  const onClose = () => abortController.abort();
+  req.on("close", onClose);
+
+  try {
+    const result = await geminiService.extractMemoryCandidate({
+      prompt: req.body.prompt,
+      signal: abortController.signal,
+    });
+    if (abortController.signal.aborted || res.writableEnded) return;
+    if (!result.ok) {
+      return res.status(result.status).json({ error: result.error });
+    }
+    res.json(result.suggestion);
+  } catch (err) {
+    if (!abortController.signal.aborted) {
+      console.error("Memory extraction error:", err.message || err);
+    }
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal memory extraction error." });
+    }
+  } finally {
+    req.off("close", onClose);
+  }
+});
+
 // Return backend-configured Male & Female Indian voice slots (no hardcoded unavailable IDs)
-app.get("/v1/voices", requireFirebaseAuth, async (_req, res) => {
+app.get("/v1/voices", verifyRequestSecurity, configRateLimit, async (_req, res) => {
   const config = await voiceService.getConfiguredVoices();
   res.json(config);
 });
 
 // Search natural Indian voices directly from the ElevenLabs Voice Library & account voices
-app.get("/v1/voices/library", requireFirebaseAuth, async (req, res) => {
+app.get("/v1/voices/library", verifyRequestSecurity, configRateLimit, async (req, res) => {
   if (!voiceService.getApiKey()) {
     return res.status(503).json({ error: "ELEVENLABS_API_KEY is not configured on the server." });
   }
@@ -87,7 +203,7 @@ app.get("/v1/voices/library", requireFirebaseAuth, async (req, res) => {
 });
 
 // Update backend runtime configuration for Male/Female Voice IDs or TTS/STT models
-app.post("/v1/voices/config", requireFirebaseAuth, async (req, res) => {
+app.post("/v1/voices/config", verifyRequestSecurity, configRateLimit, async (req, res) => {
   const updated = await voiceService.updateVoiceConfig(req.body || {});
   res.json(updated);
 });
@@ -152,7 +268,7 @@ async function handleTtsStream(req, res, isPreview = false) {
     }
   } catch (err) {
     if (!abortController.signal.aborted) {
-      console.error("TTS proxy error:", err);
+      console.error("TTS proxy error:", err.message || err);
     }
     if (!res.headersSent) {
       res.status(500).json({ error: "Internal TTS proxy error" });
@@ -165,11 +281,11 @@ async function handleTtsStream(req, res, isPreview = false) {
 }
 
 // Stream natural conversational speech (Eleven v4 Turbo primary with graceful fallback)
-app.post("/v1/tts/stream", requireFirebaseAuth, (req, res) => handleTtsStream(req, res, false));
-app.post("/v1/tts/preview", requireFirebaseAuth, (req, res) => handleTtsStream(req, res, true));
+app.post("/v1/tts/stream", verifyRequestSecurity, voiceRateLimit, (req, res) => handleTtsStream(req, res, false));
+app.post("/v1/tts/preview", verifyRequestSecurity, voiceRateLimit, (req, res) => handleTtsStream(req, res, true));
 
 // Speech-to-text via ElevenLabs Scribe v3 Live (with graceful fallback to scribe_v3/v2/v1)
-app.post("/v1/stt", requireFirebaseAuth, upload.single("audio"), async (req, res) => {
+app.post("/v1/stt", verifyRequestSecurity, voiceRateLimit, upload.single("audio"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "audio file is required" });
   }
@@ -199,7 +315,7 @@ app.post("/v1/stt", requireFirebaseAuth, upload.single("audio"), async (req, res
     });
   } catch (err) {
     if (!abortController.signal.aborted) {
-      console.error("STT proxy error:", err);
+      console.error("STT proxy error:", err.message || err);
     }
     if (!res.headersSent) {
       res.status(500).json({ error: "Internal STT proxy error" });
@@ -211,10 +327,8 @@ app.post("/v1/stt", requireFirebaseAuth, upload.single("audio"), async (req, res
 
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`SAATHI Voice Backend listening on port ${PORT}`);
+    console.log(`SAATHI Companion Backend (Gemini + ElevenLabs) listening on port ${PORT}`);
   });
 }
-
-app.createFirebaseAuthMiddleware = createFirebaseAuthMiddleware;
 
 module.exports = app;

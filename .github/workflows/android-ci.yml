@@ -159,163 +159,21 @@ jobs:
           test -s debug.keystore
           keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey
 
-      - name: Prepare & Validate Firebase google-services.json
-        id: firebase_config
-        env:
-          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
-        run: |
-          set -euo pipefail
-          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
-            if ! printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 -d > app/google-services.json 2>/dev/null; then
-              rm -f app/google-services.json
-              echo "::error::GitHub Actions secret GOOGLE_SERVICES_JSON_BASE64 is not valid Base64. Encode the Firebase google-services.json file with: base64 -w 0 app/google-services.json"
-              exit 1
-            fi
-            echo "from_secret=true" >> "$GITHUB_OUTPUT"
-            echo "Decoded app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret."
-          elif [ -s app/google-services.json ]; then
-            echo "from_secret=false" >> "$GITHUB_OUTPUT"
-            echo "Using existing app/google-services.json."
-          else
-            echo "::error::Missing app/google-services.json. Add the GitHub Actions repository secret GOOGLE_SERVICES_JSON_BASE64 (base64-encoded contents of google-services.json for Firebase project gen-lang-client-0541897442) in Settings -> Secrets and variables -> Actions."
-            exit 1
-          fi
-
-          if [ ! -s app/google-services.json ]; then
-            echo "::error::Decoded app/google-services.json is empty."
-            exit 1
-          fi
-
-          python3 - <<'PY'
-          import json, sys
-
-          path = "app/google-services.json"
-          expected_project_id = "gen-lang-client-0541897442"
-          expected_pkg = "com.aistudio.saathi.x7k9qm"
-
-          try:
-              with open(path, "r", encoding="utf-8") as f:
-                  data = json.load(f)
-          except Exception as exc:
-              print(f"::error::app/google-services.json is not valid JSON ({type(exc).__name__}). Verify GOOGLE_SERVICES_JSON_BASE64 encodes the raw JSON file.")
-              sys.exit(1)
-
-          if not isinstance(data, dict):
-              print("::error::app/google-services.json root must be a JSON object.")
-              sys.exit(1)
-
-          project_id = str((data.get("project_info") or {}).get("project_id") or "").strip()
-          if not project_id:
-              print("::error::app/google-services.json is missing project_info.project_id.")
-              sys.exit(1)
-          if project_id != expected_project_id:
-              print(
-                  f"::error::app/google-services.json belongs to a different Firebase project (expected '{expected_project_id}'). "
-                  "Download google-services.json from the SAATHI Firebase project and update GOOGLE_SERVICES_JSON_BASE64."
-              )
-              sys.exit(1)
-
-          clients = data.get("client")
-          if not isinstance(clients, list) or len(clients) == 0:
-              print("::error::app/google-services.json has no 'client' entries.")
-              sys.exit(1)
-
-          matched = None
-          for c in clients:
-              if not isinstance(c, dict):
-                  continue
-              pkg = str(((c.get("client_info") or {}).get("android_client_info") or {}).get("package_name") or "").strip()
-              if pkg == expected_pkg:
-                  matched = c
-                  break
-
-          if not matched:
-              print(f"::error::app/google-services.json does not contain an Android client entry for package '{expected_pkg}'.")
-              sys.exit(1)
-
-          app_id = str((matched.get("client_info") or {}).get("mobilesdk_app_id") or "").strip()
-          if not app_id:
-              print(f"::error::app/google-services.json client entry for '{expected_pkg}' is missing mobilesdk_app_id.")
-              sys.exit(1)
-
-          api_keys = matched.get("api_key") or []
-          has_api_key = any(
-              isinstance(k, dict) and isinstance(k.get("current_key"), str) and k["current_key"].strip()
-              for k in api_keys
-          )
-          if not has_api_key:
-              print(f"::error::app/google-services.json client entry for '{expected_pkg}' is missing api_key.current_key.")
-              sys.exit(1)
-
-          print(f"Validated app/google-services.json for project '{expected_project_id}' and package '{expected_pkg}' (mobilesdk_app_id and api_key verified for Firebase Core, AI Logic, Firestore & App Check).")
-          PY
-
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Firebase CLI, Rules Test SDK & Backend Dependencies
-        run: |
-          npm install -g firebase-tools
-          npm install --prefix /tmp/rules-test --no-save @firebase/rules-unit-testing
-          npm --prefix backend install
-
-      - name: Run Backend Voice Proxy Tests
-        run: node --test backend/server.test.js
-
-      - name: Start Firebase Auth & Firestore Emulators and Run Full Verification Suite
+      - name: Install Backend Dependencies & Run Backend Verification Tests
         run: |
           set -euo pipefail
-          firebase emulators:start --only auth,firestore --project gen-lang-client-0541897442 > /tmp/firebase-emulator.log 2>&1 &
-          EMULATOR_PID=$!
-          trap 'kill $EMULATOR_PID 2>/dev/null || true' EXIT
+          npm --prefix backend install
+          node --test backend/server.test.js
 
-          READY=0
-          for i in $(seq 1 90); do
-            if curl -s http://127.0.0.1:8085 >/dev/null && curl -s http://127.0.0.1:9099 >/dev/null; then
-              echo "Firebase Auth (9099) & Firestore (8085) emulators are ready."
-              READY=1
-              break
-            fi
-            sleep 1
-          done
-
-          if [ "$READY" -ne 1 ]; then
-            echo "ERROR: Firebase Auth/Firestore emulators failed to become ready within 90s."
-            cat /tmp/firebase-emulator.log || true
-            exit 1
-          fi
-
-          NODE_PATH=/tmp/rules-test/node_modules FIRESTORE_EMULATOR_HOST="127.0.0.1:8085" node --test firestore.test.js
-          gradle :app:processDebugGoogleServices :app:processReleaseGoogleServices :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
-
-          for res_file in \
-            app/build/generated/res/processDebugGoogleServices/values/values.xml \
-            app/build/generated/res/processReleaseGoogleServices/values/values.xml; do
-            test -s "$res_file"
-            for res_name in google_app_id google_api_key project_id; do
-              if ! grep -q "name=\"${res_name}\"" "$res_file"; then
-                echo "::error::Expected generated Firebase resource '${res_name}' missing from ${res_file}"
-                exit 1
-              fi
-            done
-          done
-          echo "Verified Firebase resources (google_app_id, google_api_key, project_id) generated for both debug and release builds."
-
-          node -e '
-            const fs = require("node:fs");
-            const xmlPath = "app/build/test-results/testDebugUnitTest/TEST-com.example.data.repository.FirestoreRepositoryRuleTest.xml";
-            const xml = fs.readFileSync(xmlPath, "utf8");
-            const tests = Number((xml.match(/tests="(\d+)"/) || [])[1] || 0);
-            const skipped = Number((xml.match(/skipped="(\d+)"/) || [])[1] || 0);
-            const failures = Number((xml.match(/failures="(\d+)"/) || [])[1] || 0);
-            const errors = Number((xml.match(/errors="(\d+)"/) || [])[1] || 0);
-            console.log({ tests, skipped, failures, errors });
-            if (tests < 4 || skipped > 0 || failures > 0 || errors > 0) {
-              throw new Error("FirestoreRepositoryRuleTest must execute all 4 emulator tests with 0 skipped/failures/errors.");
-            }
-          '
+      - name: Run Android Unit Tests & Build Debug APK
+        run: |
+          set -euo pipefail
+          gradle :app:testDebugUnitTest :app:assembleDebug :app:compileReleaseKotlin --console=plain
 
       - name: Verify & Stage Generated Debug APK
         run: |
@@ -405,16 +263,10 @@ jobs:
           path: |
             app/build/reports/tests/
             app/build/test-results/
-            /tmp/firebase-emulator.log
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Clean Up Ephemeral Keystore & Firebase Config
+      - name: Clean Up Ephemeral Keystore
         if: always()
         run: |
           rm -f "${GITHUB_WORKSPACE}/my-upload-key.jks"
-          if [ "${{ steps.firebase_config.outputs.from_secret }}" = "true" ]; then
-            rm -f app/google-services.json
-          fi
-
-
